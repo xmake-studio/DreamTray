@@ -1,0 +1,24 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>DreamTray.Plugins.CyberVfd</RootNamespace>
+    <AssemblyName>DreamTray.Plugin.CyberVfd</AssemblyName>
+    <!-- The plugin folder must carry its own dependencies (System.IO.Ports), since
+         the host knows nothing about them. -->
+    <CopyLocalLockFileAssemblies>true</CopyLocalLockFileAssemblies>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="System.IO.Ports" Version="8.0.0" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Private=false: the contracts assembly must come from the host at runtime,
+         or the plugin's IDreamPlugin would be a different type than the one the
+         loader checks against. -->
+    <ProjectReference Include="..\..\src\DreamTray.Contracts\DreamTray.Contracts.csproj"
+                      Private="false" />
+  </ItemGroup>
+
+</Project>

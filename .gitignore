@@ -1,0 +1,10 @@
+bin/
+obj/
+dist/
+
+# RyzenAdj is not redistributed here — see src/DreamTray.App/native/README.md
+native/*.dll
+native/*.sys
+
+.vs/
+*.user

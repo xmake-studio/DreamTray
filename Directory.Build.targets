@@ -1,0 +1,11 @@
+<Project>
+
+  <!-- The WindowsDesktop SDK publishes a trimmed implicit-using set that leaves out
+       System.IO. Every project here touches the filesystem, so add it back. This
+       lives in .targets rather than .props because the SDK rewrites the @(Using)
+       item group after Directory.Build.props is imported. -->
+  <ItemGroup>
+    <Using Include="System.IO" />
+  </ItemGroup>
+
+</Project>

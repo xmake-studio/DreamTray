@@ -1,0 +1,12 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <!-- The plugin ABI. Plugins reference *only* this assembly, so it must stay
+       small and stable: interfaces + plain data, no implementation. WPF is on
+       because plugins and widgets hand back FrameworkElements for their UI. -->
+  <PropertyGroup>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>DreamTray</RootNamespace>
+    <AssemblyName>DreamTray.Contracts</AssemblyName>
+  </PropertyGroup>
+
+</Project>

@@ -1,0 +1,42 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>WinExe</OutputType>
+    <UseWPF>true</UseWPF>
+    <RootNamespace>DreamTray.App</RootNamespace>
+    <AssemblyName>DreamTray</AssemblyName>
+    <ApplicationManifest>app.manifest</ApplicationManifest>
+
+    <!-- The tray icon and panel are drawn natively; no WinForms interop layer. -->
+    <UseWindowsForms>false</UseWindowsForms>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\DreamTray.Contracts\DreamTray.Contracts.csproj" />
+    <ProjectReference Include="..\DreamTray.Core\DreamTray.Core.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="native\README.md" CopyToOutputDirectory="PreserveNewest" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <!-- Build order only. The plugin is loaded from disk at runtime through its own
+         AssemblyLoadContext, so referencing its assembly here would defeat the
+         isolation the plugin system exists to provide. -->
+    <ProjectReference Include="..\..\plugins\DreamTray.Plugin.CyberVfd\DreamTray.Plugin.CyberVfd.csproj"
+                      ReferenceOutputAssembly="false" Private="false" />
+  </ItemGroup>
+
+  <!-- Stage the bundled plugin where the loader looks for it: plugins\<name>\. -->
+  <Target Name="StageBundledPlugins" AfterTargets="Build">
+    <ItemGroup>
+      <CyberVfdOutput Include="..\..\plugins\DreamTray.Plugin.CyberVfd\bin\$(Configuration)\$(TargetFramework)\**\*" />
+    </ItemGroup>
+    <Copy SourceFiles="@(CyberVfdOutput)"
+          DestinationFolder="$(OutDir)plugins\CyberVfd\%(RecursiveDir)"
+          SkipUnchangedFiles="true"
+          Condition="'@(CyberVfdOutput)' != ''" />
+  </Target>
+
+</Project>

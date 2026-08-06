@@ -1,0 +1,10 @@
+<Solution>
+  <Folder Name="/plugins/">
+    <Project Path="plugins/DreamTray.Plugin.CyberVfd/DreamTray.Plugin.CyberVfd.csproj" />
+  </Folder>
+  <Folder Name="/src/">
+    <Project Path="src/DreamTray.App/DreamTray.App.csproj" />
+    <Project Path="src/DreamTray.Contracts/DreamTray.Contracts.csproj" />
+    <Project Path="src/DreamTray.Core/DreamTray.Core.csproj" />
+  </Folder>
+</Solution>

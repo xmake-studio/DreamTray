@@ -1,0 +1,29 @@
+<Project>
+
+  <PropertyGroup>
+    <TargetFramework>net8.0-windows</TargetFramework>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <Nullable>enable</Nullable>
+    <LangVersion>latest</LangVersion>
+    <Platforms>x64</Platforms>
+    <PlatformTarget>x64</PlatformTarget>
+
+    <!-- Footprint: workstation, non-concurrent GC keeps the working set small and
+         avoids a background GC thread in a process that idles most of the time. -->
+    <ServerGarbageCollection>false</ServerGarbageCollection>
+    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <TieredPGO>false</TieredPGO>
+    <AutoreleasePoolSupport>false</AutoreleasePoolSupport>
+    <EventSourceSupport>false</EventSourceSupport>
+
+    <!-- InvariantGlobalization is deliberately OFF. It is tempting for an app whose
+         device protocols need '.' decimals, but WPF resolves a specific culture for
+         window chrome and text input, which throws under invariant mode. Protocol
+         formatting pins CultureInfo.InvariantCulture at the call site instead
+         (see VfdFrame), which is where the guarantee belongs anyway. -->
+
+    <GenerateDocumentationFile>false</GenerateDocumentationFile>
+    <Deterministic>true</Deterministic>
+  </PropertyGroup>
+
+</Project>
