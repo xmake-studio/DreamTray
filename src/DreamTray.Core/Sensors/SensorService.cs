@@ -21,6 +21,7 @@ public sealed class SensorService : IDisposable
     private readonly CpuLoadReader _cpuLoad = new();
     private readonly CpuFreqReader _cpuFreq = new();
     private readonly DiskLoadReader _diskLoad = new();
+    private readonly BatteryRateReader _battRate = new();
     private readonly float[] _threads;
 
     public SensorService()
@@ -64,6 +65,10 @@ public sealed class SensorService : IDisposable
             }
         }
 
+        // Preferred over whatever LHM produced above: LHM stops answering after an
+        // AC/battery transition. See BatteryRateReader.
+        b.BattW = _battRate.Read() ?? b.BattW;
+
         ReadPowerStatus(b);
         return b.Build();
     }
@@ -78,7 +83,9 @@ public sealed class SensorService : IDisposable
         public float NetDown, NetUp;
         public float Disk0, Disk1 = -1f;
         public string Disk1Label = "";
-        public float BattW, BattLevel = -1f;
+        /// <summary>Null until something actually measures a rate — never assume 0 W.</summary>
+        public float? BattW;
+        public float BattLevel = -1f;
         public bool OnAc, HasBattery;
         public TimeSpan? Remaining;
 
@@ -89,8 +96,11 @@ public sealed class SensorService : IDisposable
             SystemPowerKind kind;
             float power;
             if (!HasBattery) { kind = SystemPowerKind.Unknown; power = 0; }
-            else if (!OnAc) { kind = SystemPowerKind.Discharging; power = MathF.Abs(BattW); }
-            else if (BattW > 0.5f) { kind = SystemPowerKind.Charging; power = BattW; }
+            // Nothing measured a rate this tick. Saying "0 W" would be a lie that
+            // reads exactly like a real idle reading, so report it as unknown.
+            else if (BattW is not float w) { kind = SystemPowerKind.Unknown; power = 0; }
+            else if (!OnAc) { kind = SystemPowerKind.Discharging; power = MathF.Abs(w); }
+            else if (w > 0.5f) { kind = SystemPowerKind.Charging; power = w; }
             else { kind = SystemPowerKind.AcIdle; power = 0; }
 
             return new SystemSnapshot
@@ -116,7 +126,7 @@ public sealed class SensorService : IDisposable
                 Disk0Load = Disk0,
                 Disk1Load = Disk1,
                 Disk1Label = Disk1Label,
-                BatteryPower = BattW,
+                BatteryPower = BattW ?? 0f,
                 BatteryLevel = BattLevel,
                 OnAcPower = OnAc,
                 BatteryPresent = HasBattery,
@@ -216,15 +226,17 @@ public sealed class SensorService : IDisposable
 
     private static void ReadBattery(IHardware hw, Builder b)
     {
-        // LHM exposes a single signed "Charge/Discharge Rate" power sensor
-        // (+ charging / - discharging). Older builds split it into two.
+        // There is one rate sensor, and it is not signed: LHM stores the magnitude
+        // and encodes the direction by rewriting the sensor's *name* on every poll —
+        // "Charge Rate", "Discharge Rate", or "Charge/Discharge Rate" while the rate
+        // is exactly zero. Test for discharge first, since the zero-rate name also
+        // ends in "Discharge Rate" (and zero negated is still zero).
         foreach (var sen in hw.Sensors)
         {
-            if (!sen.Value.HasValue || float.IsNaN(sen.Value.Value)) continue;
             if (sen.SensorType != SensorType.Power) continue;
-            if (sen.Name.Contains("Charge/Discharge Rate")) b.BattW = sen.Value.Value;
-            else if (sen.Name.Contains("Charge Rate")) b.BattW += sen.Value.Value;
-            else if (sen.Name.Contains("Discharge Rate")) b.BattW -= sen.Value.Value;
+            if (sen.Value is not float w || float.IsNaN(w)) continue;
+            if (sen.Name.Contains("Discharge Rate")) b.BattW = -MathF.Abs(w);
+            else if (sen.Name.Contains("Charge Rate")) b.BattW = MathF.Abs(w);
         }
     }
 
@@ -267,7 +279,7 @@ public sealed class SensorService : IDisposable
             float remainingFraction = 1f - b.BattLevel;
             float packWh = BatteryInfo.DesignCapacityWh;
             if (packWh > 0)
-                b.Remaining = TimeSpan.FromHours(packWh * remainingFraction / b.BattW);
+                b.Remaining = TimeSpan.FromHours(packWh * remainingFraction / b.BattW.Value);
         }
     }
 
@@ -296,6 +308,7 @@ public sealed class SensorService : IDisposable
         _computer.Close();
         _cpuFreq.Dispose();
         _diskLoad.Dispose();
+        _battRate.Dispose();
     }
 
     private sealed class UpdateVisitor : IVisitor
