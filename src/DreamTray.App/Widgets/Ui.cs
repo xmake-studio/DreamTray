@@ -109,13 +109,23 @@ internal static class Ui
         return slider;
     }
 
+    /// <param name="dimmed">
+    /// Optional predicate marking entries that are valid but off the beaten path — they
+    /// stay selectable and are drawn faded so the ordinary choices stand out.
+    /// </param>
     public static ComboBox Combo<T>(IEnumerable<T> items, T? selected, Action<T> onChanged,
-                                    Func<T, string>? label = null)
+                                    Func<T, string>? label = null, Func<T, bool>? dimmed = null)
     {
         var combo = new ComboBox { Style = Find("FluentComboBox") };
         var list = items.ToList();
         foreach (var item in list)
-            combo.Items.Add(new ComboEntry<T>(item, label?.Invoke(item) ?? item?.ToString() ?? ""));
+        {
+            var entry = new ComboEntry<T>(item, label?.Invoke(item) ?? item?.ToString() ?? "");
+            if (dimmed?.Invoke(item) == true)
+                combo.Items.Add(new ComboBoxItem { Content = entry, Opacity = DimmedOpacity });
+            else
+                combo.Items.Add(entry);
+        }
 
         if (selected != null)
         {
@@ -125,10 +135,15 @@ internal static class Ui
 
         combo.SelectionChanged += (_, _) =>
         {
-            if (combo.SelectedItem is ComboEntry<T> entry) onChanged(entry.Item);
+            if (Unwrap(combo.SelectedItem) is ComboEntry<T> entry) onChanged(entry.Item);
         };
         return combo;
     }
+
+    private const double DimmedOpacity = 0.5;
+
+    private static object? Unwrap(object? item) =>
+        item is ComboBoxItem container ? container.Content : item;
 
     /// <summary>Wrapper so a combo shows a friendly label without a DataTemplate.</summary>
     private sealed record ComboEntry<T>(T Item, string Label)

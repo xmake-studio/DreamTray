@@ -102,6 +102,15 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
 
         var selectedResolution = (current.Width, current.Height);
 
+        // Windows lists modes that letterbox or stretch the panel alongside the ones that
+        // fill it. They still work, so they stay selectable — just faded, so the shapes
+        // that match the panel read as the normal choices. The largest mode is the panel's
+        // native one and defines the reference ratio.
+        var native = resolutions[0];
+        double nativeRatio = (double)native.Width / native.Height;
+        bool OffRatio((int Width, int Height) r) =>
+            Math.Abs((double)r.Width / r.Height - nativeRatio) > 0.01;
+
         var resolutionCombo = Ui.Combo(resolutions, selectedResolution, r =>
         {
             if (r == (current.Width, current.Height)) return;
@@ -113,7 +122,7 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
                 : modes.Where(m => m.Width == r.Width && m.Height == r.Height)
                        .Max(m => m.RefreshHz);
             ApplyMode(device.DeviceName, new DisplayMode(r.Width, r.Height, hz));
-        }, r => $"{r.Width} × {r.Height}");
+        }, r => $"{r.Width} × {r.Height}", OffRatio);
 
         var rates = modes
             .Where(m => m.Width == selectedResolution.Width && m.Height == selectedResolution.Height)

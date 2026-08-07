@@ -55,9 +55,26 @@ internal sealed class TrayController : IDisposable
 
     public void ShowPanel()
     {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
         _panel ??= new PanelWindow(_services, OpenSettings);
         _panel.ShowNear(_icon?.GetIconRect() ?? Rect.Empty);
+        // Everything above runs on the UI thread between the click and the panel
+        // being composed, so anything slow in a widget's OnShown shows up here as a
+        // late flyout. Logged only when it is long enough for a user to notice.
+        if (clock.ElapsedMilliseconds >= 100)
+            Logging.Log.Write($"panel open took {clock.ElapsedMilliseconds} ms on the UI thread");
     }
+
+    /// <summary>
+    /// Build the panel before the user asks for it.
+    ///
+    /// The window is created once and reused, so the cost of building it — the
+    /// widgets, their views, the first pass over the WPF resource dictionaries, and
+    /// the JIT for all of it — lands entirely on whichever click happens to be the
+    /// first. That is the one open that is reliably slow. Doing it at idle after
+    /// startup moves the cost to a moment when nobody is waiting.
+    /// </summary>
+    public void Prewarm() => _panel ??= new PanelWindow(_services, OpenSettings);
 
     public void OpenSettings()
     {

@@ -56,6 +56,34 @@ public sealed class BrightnessService : IDisposable
         }
     }
 
+    /// <summary>
+    /// Re-enumerate off the calling thread and call <paramref name="onCompleted"/>
+    /// (on a pool thread) once the new list is in place.
+    ///
+    /// Enumeration is *not* cheap and it is not bounded: the WMI query for the
+    /// backlight interface costs tens of milliseconds on a warm service and far more
+    /// on a cold one, and every external monitor adds a DDC/CI round trip over I2C —
+    /// which a monitor that is asleep, on another input, or simply slow can stretch
+    /// to seconds. Doing that on the UI thread is what made the panel appear late.
+    ///
+    /// Overlapping calls collapse into the one already running: the caller is asking
+    /// for "current", and a second scan started 20 ms later cannot be more current
+    /// than the one in flight.
+    /// </summary>
+    public void RefreshAsync(Action? onCompleted = null)
+    {
+        if (Interlocked.CompareExchange(ref _refreshing, 1, 0) != 0) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            try { GetDisplays(refresh: true); }
+            catch (Exception ex) { _log($"display re-scan failed: {ex.Message}"); }
+            finally { Interlocked.Exchange(ref _refreshing, 0); }
+            onCompleted?.Invoke();
+        });
+    }
+
+    private int _refreshing;
+
     /// <summary>Re-read the current brightness of every display (a few ms each).</summary>
     public void RefreshValues()
     {

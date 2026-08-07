@@ -96,6 +96,9 @@ public partial class App : Application
         {
             _services.Plugins.LoadAll();
             _services.RestoreTdpOnStartup();
+            // After the plugins, so plugin widgets are part of the panel that gets
+            // built — and so nothing here delays the tray icon appearing.
+            _tray.Prewarm();
             Log.Write("startup complete");
         });
     }

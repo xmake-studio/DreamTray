@@ -156,6 +156,9 @@ public sealed class AppServices : IDisposable
         public IReadOnlyList<DisplayTarget> GetDisplays(bool refresh = false) =>
             s.Brightness.GetDisplays(refresh);
 
+        public void RefreshDisplaysAsync(Action? onCompleted = null) =>
+            s.Brightness.RefreshAsync(onCompleted);
+
         public bool SetBrightness(string displayId, int percent) =>
             s.Brightness.SetBrightness(displayId, percent);
 

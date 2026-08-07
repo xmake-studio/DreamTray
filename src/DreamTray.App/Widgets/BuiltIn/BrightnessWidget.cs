@@ -46,9 +46,28 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
 
     protected override void OnShown()
     {
-        // Cheap (a WMI read plus one DDC read per monitor) and only on open.
-        Hardware.GetDisplays(refresh: true);
+        // Show the displays we already know about straight away, and re-scan behind
+        // the panel. The scan is a WMI query plus a DDC/CI round trip per external
+        // monitor: usually tens of milliseconds, occasionally seconds when a monitor
+        // is asleep or slow to answer over I2C. Doing it here on the UI thread held
+        // the whole panel back — every widget builds and the window composes after
+        // this returns, so a dozing monitor delayed the flyout by however long it
+        // took to reply.
         Rebuild();
+        RefreshDisplays();
+    }
+
+    /// <summary>Re-scan in the background and rebuild when the new list lands.</summary>
+    private void RefreshDisplays()
+    {
+        var rows = _rows;
+        if (rows == null) return;
+        Hardware.RefreshDisplaysAsync(() => rows.Dispatcher.BeginInvoke(() =>
+        {
+            // The panel may have closed, or the widget been removed, while the scan
+            // was out; rebuilding a detached view is harmless but pointless.
+            if (_rows == rows) Rebuild();
+        }));
     }
 
     private void Rebuild()
@@ -126,9 +145,5 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
         Ui.Caption("Brightness is applied to the built-in panel through the ACPI backlight " +
                    "interface and to external monitors over DDC/CI."),
         Ui.LabelRow("Move all displays together", Ui.Switch(LinkDisplays, v => LinkDisplays = v)),
-        Ui.Button("Re-scan displays", () =>
-        {
-            Hardware.GetDisplays(refresh: true);
-            Rebuild();
-        }));
+        Ui.Button("Re-scan displays", RefreshDisplays));
 }

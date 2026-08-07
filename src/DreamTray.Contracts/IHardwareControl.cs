@@ -10,6 +10,19 @@ public interface IHardwareControl
     // ---- Display brightness ----
     /// <summary>Displays that accept a brightness command, re-enumerated on demand.</summary>
     IReadOnlyList<DisplayTarget> GetDisplays(bool refresh = false);
+    /// <summary>
+    /// Re-enumerate displays without blocking the caller, then invoke
+    /// <paramref name="onCompleted"/> (on a background thread — marshal it yourself
+    /// before touching UI). Enumeration talks to WMI and to every monitor over
+    /// DDC/CI, which can take a second or more, so anything on the UI thread — a
+    /// widget opening, in particular — must use this rather than
+    /// <c>GetDisplays(refresh: true)</c>.
+    /// </summary>
+    void RefreshDisplaysAsync(Action? onCompleted = null)
+    {
+        GetDisplays(refresh: true);
+        onCompleted?.Invoke();
+    }
     /// <summary>Set brightness 0..100 on one display. Returns false if the display refused.</summary>
     bool SetBrightness(string displayId, int percent);
     /// <summary>Set brightness 0..100 on every controllable display.</summary>
