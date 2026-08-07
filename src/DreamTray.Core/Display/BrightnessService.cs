@@ -94,26 +94,42 @@ public sealed class BrightnessService : IDisposable
         }
 
         // --- external monitors (DDC/CI) ---
-        int index = 0;
+        var externals = new List<(Target Probe, string Description, int Brightness)>();
         foreach (var (handle, description) in EnumeratePhysicalMonitors())
         {
-            index++;
-            var t = new Target
+            var probe = new Target
             {
-                Public = new DisplayTarget($"ddc{index}", Describe(description, index),
-                                           DisplayKind.External, true),
+                Public = new DisplayTarget("", "", DisplayKind.External, true),
                 DdcHandle = handle,
             };
             // A monitor that will not report brightness cannot be set either — most
             // often the internal panel, already covered by WMI above.
-            int current = ReadDdcBrightness(t);
+            int current = ReadDdcBrightness(probe);
             if (current < 0)
             {
                 DestroyPhysicalMonitor(handle);
                 continue;
             }
-            t.Public.Brightness = current;
-            list.Add(t);
+            externals.Add((probe, description, current));
+        }
+
+        // Numbering only makes sense once we know how many survived the probe: a
+        // lone external monitor is just "External display", not "External display 1".
+        for (int i = 0; i < externals.Count; i++)
+        {
+            var (probe, description, current) = externals[i];
+            list.Add(new Target
+            {
+                Public = new DisplayTarget($"ddc{i + 1}",
+                                           Describe(description, externals.Count == 1 ? null : i + 1),
+                                           DisplayKind.External, true)
+                {
+                    Brightness = current,
+                },
+                DdcHandle = probe.DdcHandle,
+                MinDdc = probe.MinDdc,
+                MaxDdc = probe.MaxDdc,
+            });
         }
 
         _targets = list;
@@ -121,9 +137,9 @@ public sealed class BrightnessService : IDisposable
              string.Join(", ", list.Select(t => $"{t.Public.Id}={t.Public.Name}")));
     }
 
-    private static string Describe(string description, int index) =>
+    private static string Describe(string description, int? index) =>
         string.IsNullOrWhiteSpace(description) || description == "Generic PnP Monitor"
-            ? $"External display {index}"
+            ? (index is null ? "External display" : $"External display {index}")
             : description;
 
     // ---------------------------------------------------------------- writing
