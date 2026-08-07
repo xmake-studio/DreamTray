@@ -121,7 +121,6 @@ internal sealed class BatteryTimeWidget(IWidgetContext context) : MetricWidget(c
     protected override IReadOnlyList<MetricRow> Rows { get; } =
     [
         new("Charge", s => s.BatteryLevel >= 0 ? Fmt.Percent(s.BatteryLevel) : "—"),
-        new("Source", s => !s.BatteryPresent ? "no battery" : s.OnAcPower ? "charger" : "battery"),
         // Windows only estimates time-to-empty; time-to-full is derived from the
         // measured charge rate and the pack's full-charge energy.
         new("Remaining", s => Fmt.Duration(s.BatteryTimeRemaining)),

@@ -182,12 +182,10 @@ internal sealed class SettingsWindow : Window
             Section("Start-up",
                 Ui.LabelRow("Start DreamTray when I sign in", autostart),
                 Ui.Caption("Registered as a scheduled task with highest privileges, so it starts " +
-                           "elevated without a UAC prompt. Sensor readings and the power limit " +
-                           "both need those rights.")),
+                           "elevated without a UAC prompt.")),
             Section("Appearance",
                 Ui.LabelRow("App theme", theme),
-                Ui.Caption("The tray icon always follows the taskbar's own light/dark setting so it " +
-                           "matches the network and volume icons.")),
+                Ui.Caption("The tray icon always follows the taskbar's own light/dark setting.")),
             Section("Files",
                 Ui.LabelRow("Settings and log", Ui.Button("Open folder", () =>
                     OpenPath(Settings.SettingsStore.Folder)))));
@@ -225,10 +223,8 @@ internal sealed class SettingsWindow : Window
             Ui.LabelRow("Opening (ms)", openMs),
             Ui.LabelRow("Closing (ms)", closeMs),
             Ui.Caption($"Defaults are {Settings.AnimationSettings.DefaultOpenMs} ms in and " +
-                       $"{Settings.AnimationSettings.DefaultCloseMs} ms out, which is about what " +
-                       "Windows uses for its own tray flyouts. The panel travels a whole screen " +
-                       "height, so much below 200 ms starts to look like a jump rather than a " +
-                       "slide. 0 turns that direction off on its own."),
+                       $"{Settings.AnimationSettings.DefaultCloseMs} ms out. 0 turns that " +
+                       "direction off."),
             reset);
 
         // Disabled rather than hidden: the values stay readable, and the page does not
@@ -238,9 +234,8 @@ internal sealed class SettingsWindow : Window
         return Ui.Stack(
             Section("Panel",
                 Ui.LabelRow("Animate the panel", enabled),
-                Ui.Caption("The panel slides in from beyond the screen edge and out again the same " +
-                           "way, passing under the taskbar. Turned off, it simply appears and " +
-                           "disappears at its resting position.")),
+                Ui.Caption("The panel slides in from the screen edge and out again the same way. " +
+                           "Turned off, it appears and disappears in place.")),
             timing);
     }
 
@@ -289,9 +284,8 @@ internal sealed class SettingsWindow : Window
             Section("Backend", Ui.Caption(tdp.StatusText)),
             Section("Keeping the limit applied",
                 Ui.LabelRow("Re-apply every (seconds)", reapply),
-                Ui.Caption("OEM utilities rewrite the SMU limits on their own schedule, which silently " +
-                           "undoes your setting. Re-applying periodically wins that argument. " +
-                           "0 disables it.")),
+                Ui.Caption("OEM utilities can rewrite the SMU limits and undo your setting. " +
+                           "0 disables re-applying.")),
         };
 
         if (_services.Hardware.HasBattery)
@@ -307,12 +301,10 @@ internal sealed class SettingsWindow : Window
             Ui.LabelRow("Minimum (W)", minWatts),
             Ui.LabelRow("Maximum (W)", maxWatts),
             Ui.Caption(config.RangeAutoDetected
-                ? "Bounds for the TDP widget's slider. These were measured on this machine: the " +
-                  "maximum comes from the highest power limit your firmware is configured with, " +
-                  "and it is re-checked at every start (it can only go up, in case the first " +
-                  "reading happened on battery). Type a value to pin the range instead."
-                : "Bounds for the TDP widget's slider, set by hand — automatic detection no longer " +
-                  "touches them. Raise the maximum only if you know your cooling can take it.")));
+                ? "Bounds for the TDP widget's slider, detected on this machine. Type a value " +
+                  "to pin the range instead."
+                : "Bounds for the TDP widget's slider, set by hand. Raise the maximum only if " +
+                  "your cooling can take it.")));
 
         return Ui.Stack([.. sections]);
     }
@@ -322,9 +314,7 @@ internal sealed class SettingsWindow : Window
         var stack = new StackPanel();
 
         var header = Section("Plugins",
-            Ui.Caption("Plugins live in the app's plugins\\ folder, one folder each. They read the " +
-                       "same sensor data the widgets do, so a plugin never starts a second " +
-                       "hardware-monitoring stack."),
+            Ui.Caption("Plugins live in the app's plugins\\ folder, one folder each."),
             Ui.Button("Open plugins folder", () => OpenPath(PluginManager.PluginsRoot)));
         stack.Children.Add(header);
 
@@ -389,8 +379,7 @@ internal sealed class SettingsWindow : Window
                            "the power limit from the AMD SMU via PawnIO.")),
             Section("Diagnostics",
                 Ui.Caption("Run DreamTray.exe --dump from a console to print every detected sensor " +
-                           "and the state of each backend. That is the fastest way to find out why " +
-                           "a reading is missing."),
+                           "and the state of each backend."),
                 Ui.LabelRow("Log file", Ui.Button("Open", () => OpenPath(Logging.Log.FilePath)))));
     }
 

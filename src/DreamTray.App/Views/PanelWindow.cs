@@ -15,7 +15,7 @@ namespace DreamTray.App.Views;
 ///
 /// It is created once and hidden rather than closed, so reopening is instant.
 /// While hidden it tells <see cref="WidgetManager"/> so every widget drops its
-/// sensor subscription вЂ” that is what makes the app cost nothing when idle.
+/// sensor subscription — that is what makes the app cost nothing when idle.
 /// </summary>
 internal sealed class PanelWindow : Window
 {
@@ -55,7 +55,7 @@ internal sealed class PanelWindow : Window
 
     // Where the panel was anchored when it was opened. Adding or removing a widget
     // changes the content height, and SizeToContent grows the window from its top-
-    // left corner вЂ” so without re-anchoring, the panel drifts off the work area.
+    // left corner — so without re-anchoring, the panel drifts off the work area.
     private Point _anchor;
     private bool _anchored;
 
@@ -390,7 +390,7 @@ internal sealed class PanelWindow : Window
         if (toIndex >= 0 && toIndex != _dragFromIndex)
         {
             // Move() re-raises LayoutChanged, which rebuilds the list from the
-            // manager's order вЂ” the visual and the model converge there.
+            // manager's order — the visual and the model converge there.
             _manager.Move(_dragFromIndex, toIndex);
         }
         _dragFromIndex = -1;
@@ -423,7 +423,7 @@ internal sealed class PanelWindow : Window
         ApplyWindowEffects();
         SetAnchor(iconRect);
         // Height is content-driven, so lay out before measuring the chrome or
-        // positioning вЂ” otherwise both run on a stale (zero) height and the panel
+        // positioning — otherwise both run on a stale (zero) height and the panel
         // lands off the bottom of the screen.
         UpdateLayout();
         UpdateScrollerMaxHeight();
@@ -764,7 +764,7 @@ internal sealed class PanelWindow : Window
         UpdateCornerRadius();
 
         // Acrylic is the material Windows uses for its own tray flyouts. If DWM
-        // refuses it вЂ” an older build, or transparency effects switched off вЂ” the
+        // refuses it — an older build, or transparency effects switched off — the
         // theme falls back to opaque surfaces and the window paints them itself.
         bool translucent = WindowEffects.TryApplyBackdrop(this, WindowEffects.Backdrop.Acrylic);
         (Application.Current as App)?.ApplyTheme(translucent);

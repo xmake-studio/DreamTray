@@ -57,8 +57,7 @@ internal sealed class CyberVfdSettingsView : UserControl
 
         // The caption belongs to the row above it, so it carries a tighter gap than
         // the standard one PluginUi.Stack hands out.
-        var powerNote = PluginUi.Caption("Off cuts the high-voltage supply and the backlight relay — " +
-                                         "the panel draws nothing and DreamTray stops sending frames.");
+        var powerNote = PluginUi.Caption("Off cuts the high-voltage supply and the backlight relay.");
         powerNote.Margin = new Thickness(0, 4, 0, 0);
 
         var rescan = PluginUi.Button("Re-scan ports", RefreshPorts);

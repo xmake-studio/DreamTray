@@ -8,8 +8,8 @@ using DreamTray.App.Widgets;
 namespace DreamTray.App.Views;
 
 /// <summary>
-/// The card drawn around every widget: title, a settings flyout, and вЂ” in edit
-/// mode вЂ” a drag grip and a remove button.
+/// The card drawn around every widget: title, a settings flyout, and — in edit
+/// mode — a drag grip and a remove button.
 ///
 /// The chrome is the panel's, not the widget's: a widget only supplies its body
 /// and (optionally) a settings view, so a plugin cannot draw a card that looks out
@@ -113,7 +113,7 @@ internal sealed class WidgetHost : Border
     /// Hand the widget's own elements back before this card is discarded. A widget
     /// caches its view (and any header accessory) and hands out the same instance
     /// every time, so a replacement card cannot adopt one that is still a logical
-    /// child of this one вЂ” WPF throws rather than re-parenting, which would abort
+    /// child of this one — WPF throws rather than re-parenting, which would abort
     /// the rebuild and silently drop every widget below it.
     /// </summary>
     public void Detach()

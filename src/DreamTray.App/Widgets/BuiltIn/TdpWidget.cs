@@ -175,8 +175,8 @@ internal sealed class TdpWidget : WidgetBase
             Ui.Caption(_service.StatusText),
             Ui.Separator(),
             Ui.LabelRow("Re-apply every (seconds)", reapply),
-            Ui.Caption("OEM power software rewrites these limits on its own schedule. " +
-                       "Re-applying periodically keeps your value in force. 0 turns it off."),
+            Ui.Caption("OEM power software can rewrite these limits and undo your value. " +
+                       "0 turns re-applying off."),
         };
 
         // Per-source defaults need two power sources to switch between.

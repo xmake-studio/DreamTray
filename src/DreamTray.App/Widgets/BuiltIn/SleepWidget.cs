@@ -19,7 +19,7 @@ internal sealed class SleepWidgetFactory : IWidgetFactory
 /// The two sleep settings worth reaching for without opening Settings: how long the
 /// machine idles before standby, and whether closing the lid puts it to sleep.
 ///
-/// Windows keeps a separate value for mains and battery, and so do we вЂ” but the
+/// Windows keeps a separate value for mains and battery, and so do we — but the
 /// widget only ever shows and edits the half that is in force right now. Showing
 /// both would double the controls to make the inactive half editable, which is the
 /// job of the Windows page, not of a tray flyout. The header caption says which
@@ -182,10 +182,8 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
         var children = new List<UIElement>
         {
             Ui.Caption(policy.HasBattery
-                ? "These are the Windows power-plan settings for the power source you are on " +
-                  "right now вЂ” the same values as Settings вЂє System вЂє Power & battery. Plug in " +
-                  "or unplug and the widget shows the other set."
-                : "These are the Windows power-plan settings for the active plan."),
+                ? "Windows power-plan settings for the power source in use right now."
+                : "Windows power-plan settings for the active plan."),
         };
 
         if (policy.HasLid)
@@ -195,8 +193,6 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
             {
                 children.Add(Ui.Separator());
                 children.Add(Ui.LabelRow("On lid close", LidCombo(action.Value)));
-                children.Add(Ui.Caption("Hibernate and shut down are here rather than on the panel " +
-                                        "because they are rarely what you want from a lid."));
             }
         }
 
