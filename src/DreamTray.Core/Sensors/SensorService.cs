@@ -22,6 +22,7 @@ public sealed class SensorService : IDisposable
     private readonly CpuFreqReader _cpuFreq = new();
     private readonly DiskLoadReader _diskLoad = new();
     private readonly BatteryRateReader _battRate = new();
+    private readonly PagefileReader _pagefile = new();
     private readonly float[] _threads;
 
     public SensorService()
@@ -50,6 +51,8 @@ public sealed class SensorService : IDisposable
         // power API answers everywhere, so it is used unconditionally.
         _cpuFreq.Read(out b.ClockAvg, out b.ClockMax);
         _diskLoad.Read(out b.Disk0, out b.Disk1, out b.Disk1Label);
+        // LHM exposes commit charge but not pagefile usage, and the two are far apart.
+        b.Swap = _pagefile.Read();
 
         foreach (var hw in _computer.Hardware)
         {
@@ -197,20 +200,28 @@ public sealed class SensorService : IDisposable
         b.GpuTemp = gpuTemp;
     }
 
+    /// <summary>
+    /// Called once per Memory node. LHM 0.9.6 split memory into *two* nodes,
+    /// "Total Memory" (physical) and "Virtual Memory" (commit charge), which both
+    /// expose sensors named plainly "Memory Used"/"Memory Available" — up to 0.9.4
+    /// there was a single node and the commit sensors carried longer "Virtual
+    /// Memory ..." names. Keying off the sensor name alone would therefore let the
+    /// commit node overwrite physical RAM, so the node name decides instead.
+    /// </summary>
     private static void ReadMemory(IHardware hw, Builder b)
     {
-        float used = 0, avail = 0, virtUsed = 0;
+        if (hw.Name.Contains("Virtual", StringComparison.OrdinalIgnoreCase)) return;
+
+        float used = 0, avail = 0;
         foreach (var sen in hw.Sensors)
         {
             if (sen.SensorType != SensorType.Data || !sen.Value.HasValue) continue;
             float v = sen.Value.Value; // GB
             if (sen.Name == "Memory Used") used = v;
             else if (sen.Name == "Memory Available") avail = v;
-            else if (sen.Name == "Virtual Memory Used") virtUsed = v;
         }
         b.RamUsed = used;
         b.RamTotal = used + avail;
-        b.Swap = MathF.Max(0, virtUsed - used); // commit beyond physical ~= pagefile in use
     }
 
     private static void ReadNetwork(IHardware hw, Builder b)
@@ -309,6 +320,7 @@ public sealed class SensorService : IDisposable
         _cpuFreq.Dispose();
         _diskLoad.Dispose();
         _battRate.Dispose();
+        _pagefile.Dispose();
     }
 
     private sealed class UpdateVisitor : IVisitor

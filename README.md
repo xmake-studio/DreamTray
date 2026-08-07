@@ -7,8 +7,7 @@ widgets you can rearrange, remove and configure individually.
 
 It also hosts **plugins**, so background tools that need system metrics can live
 here instead of running their own tray icon and their own copy of
-LibreHardwareMonitor. The bundled **CyberVFD** plugin replaces the standalone
-`pc_agent` from the CyberVFD project.
+LibreHardwareMonitor.
 
 Nothing in it is written for one particular machine: every panel probes what it is
 running on and hides itself when the hardware isn't there. See
@@ -42,7 +41,6 @@ missing widget, not an error.
 | Battery, and every "on battery / on charger" rule | Laptops and tablets. **On a desktop these do not appear at all** — no Battery widget, no battery row in Component power, no per-power-source TDP defaults, no automatic theme or refresh-rate switching. |
 | Sleep timeout | Any machine with a readable Windows power plan. The lid-close control appears only where a lid exists. |
 | Resolution & refresh rate | Any display the graphics driver enumerates modes for. |
-| CyberVFD plugin | Only with the ESP32-C3 / GP1247AI panel it was written for. Disabled unless you turn it on. |
 
 **Tested on** a Ryzen 7 7840HS + Radeon 780M laptop under Windows 11. Other
 configurations are supported by construction rather than by testing — if
@@ -67,7 +65,9 @@ and wasn't detected.
 | Load | CPU, GPU, memory. |
 | Sleep | Standby idle timeout and the lid-close action, read and written on the active Windows power plan. Shows the AC or battery half depending on what you are running on, and follows the charger. |
 | Resolution & refresh rate | Per-display mode picker. On a laptop, optionally drop to a chosen refresh rate on battery. |
-| CyberVFD panel *(plugin)* | Display on/off and connection state. |
+
+Plugins can add widgets of their own; the bundled one is listed under
+[Writing a plugin](#writing-a-plugin).
 
 Widgets are **drag-reorderable** (the ✎ button turns on edit mode), removable, and
 re-addable from the **+** picker. Order and per-widget settings persist in
@@ -260,14 +260,10 @@ rooted at that folder, so two plugins can depend on different versions of the sa
 library. `DreamTray.Contracts` is deliberately resolved from the host so the shared
 interfaces are the same types on both sides.
 
-### The bundled CyberVFD plugin
+### The bundled plugin
 
-Streams metrics to the ESP32-C3 / GP1247AI panel over USB serial at 1 Hz, using
-the same handshake discovery (`CVFD?` → `CVFD1 …`) and the same wire format as the
-old standalone agent, so **existing firmware works unchanged**. Enable it in
-Settings → Plugins. Serial I/O runs on its own thread; a wedged COM port cannot
-stall the UI.
-
-Once it is running, the old `CyberVfdAgent` tray app should be uninstalled
-(`uninstall.bat` in that project) — otherwise two processes fight over the port and
-two copies of LibreHardwareMonitor load the same driver.
+`plugins/DreamTray.Plugin.CyberVfd/` is a complete worked example — sensor
+subscription, a background worker, persisted settings, a widget and a settings
+page. See
+[its README](plugins/DreamTray.Plugin.CyberVfd/README.md) for what it does and how
+to set it up.

@@ -204,6 +204,65 @@ public sealed class DiskLoadReader : IDisposable
 }
 
 /// <summary>
+/// Pagefile bytes actually in use — what a user means by "swap", and what Task
+/// Manager reports. LibreHardwareMonitor only exposes commit charge; commit counts
+/// reserved-but-never-touched pages, so estimating swap as "commit beyond physical"
+/// overstates it several-fold on a machine with RAM to spare (23 GB against a real
+/// 2.4 GB on the development box).
+///
+/// \Paging File(_Total)\% Usage is the size-weighted percentage across every
+/// pagefile. The size it is a percentage *of* is the commit limit minus physical
+/// RAM, since Windows sets the limit to RAM + pagefiles; deriving it that way
+/// rather than from a one-shot WMI query keeps it right when Windows grows a
+/// system-managed pagefile at runtime.
+/// </summary>
+public sealed class PagefileReader : IDisposable
+{
+    [StructLayout(LayoutKind.Sequential)]
+    private struct PerformanceInformation
+    {
+        public int cb;
+        public nint CommitTotal, CommitLimit, CommitPeak;
+        public nint PhysicalTotal, PhysicalAvailable, SystemCache, KernelTotal, KernelPaged, KernelNonpaged;
+        public nint PageSize;
+        public int HandleCount, ProcessCount, ThreadCount;
+    }
+
+    [DllImport("psapi.dll")]
+    private static extern bool GetPerformanceInfo(out PerformanceInformation pi, int size);
+
+    private const double Gib = 1024 * 1024 * 1024;
+
+    private readonly PdhArrayCounter _counter = new(@"\Paging File(*)\% Usage");
+
+    /// <summary>
+    /// Pagefile in use, in GiB. Zero when the machine has no pagefile — which is a
+    /// true reading, not a failure.
+    /// </summary>
+    public float Read()
+    {
+        double total = -1, single = -1; int instances = 0;
+        foreach (var (name, value) in _counter.Read())
+        {
+            if (name.Contains("_Total", StringComparison.OrdinalIgnoreCase)) total = value;
+            else { single = value; instances++; }
+        }
+        // With one pagefile its own percentage is the aggregate, so accept it if the
+        // system did not synthesise a _Total instance.
+        if (total < 0 && instances == 1) total = single;
+        if (total < 0) return 0f;
+
+        if (!GetPerformanceInfo(out var pi, Marshal.SizeOf<PerformanceInformation>())) return 0f;
+        double sizeGib = (double)(pi.CommitLimit - pi.PhysicalTotal) * pi.PageSize / Gib;
+        if (sizeGib <= 0) return 0f;
+
+        return (float)Math.Max(0, total / 100.0 * sizeGib);
+    }
+
+    public void Dispose() => _counter.Dispose();
+}
+
+/// <summary>
 /// Thin wrapper over a wildcard PDH counter. Owns the query handle and the unmanaged
 /// result buffer, which it reuses between reads so sampling allocates nothing.
 /// </summary>
