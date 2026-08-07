@@ -3,6 +3,7 @@ using System.Windows.Controls;
 using System.Windows.Controls.Primitives;
 using System.Windows.Input;
 using System.Windows.Media;
+using System.Windows.Media.Animation;
 using DreamTray.App.Interop;
 using DreamTray.App.Widgets;
 
@@ -21,6 +22,20 @@ internal sealed class PanelWindow : Window
     private const double PanelWidth = 340;
     private const double EdgeMargin = 12;
     private const double CornerRadius = 16;
+
+    // Windows 11's tray flyouts do not fade. They start entirely outside the monitor,
+    // travel the whole way in — past the taskbar, which draws over them — and stop at
+    // their resting position. Dismissal runs the same trip backwards, faster.
+    //
+    // The travel here is close to a full screen height, which rules out the very
+    // aggressive spline the shell uses for its short offset animations: covering most
+    // of a monitor in the first few frames leaves visible gaps between them, and reads
+    // as a stutter rather than as speed. A plain cubic ease-out over a longer duration
+    // keeps the per-frame step small enough to stay smooth.
+    private static readonly IEasingFunction OpenEase =
+        new CubicEase { EasingMode = EasingMode.EaseOut };
+    private static readonly IEasingFunction CloseEase =
+        new QuadraticEase { EasingMode = EasingMode.EaseIn };
 
     private readonly AppServices _services;
     private readonly Action _openSettings;
@@ -43,7 +58,36 @@ internal sealed class PanelWindow : Window
     // left corner вЂ” so without re-anchoring, the panel drifts off the work area.
     private Point _anchor;
     private bool _anchored;
-    private bool _cornerUpdateQueued;
+
+    // Size the rounded-corner region was last built for, in device pixels. The region
+    // does not scale with the window, so it has to be rebuilt whenever these change.
+    private int _regionWidth = -1;
+    private int _regionHeight = -1;
+
+    // The two ends of the slide. _rest* is where the panel belongs once it has
+    // settled, _offscreenTop* is the far end just past the monitor edge. Kept in
+    // device pixels because that is what the per-frame move takes, and in DIPs
+    // because that is what WPF's Left/Top take once the panel is at rest.
+    private int _leftPx;
+    private double _restTopPx;
+    private double _offscreenTopPx;
+    private double _restTop;
+    private bool _sliding;
+    private bool _closing;
+
+    // Slide state. The move is driven off the compositor's frame callback rather
+    // than a WPF animation — see StartSlide.
+    private readonly System.Diagnostics.Stopwatch _slideClock = new();
+    private double _slideFromPx;
+    private double _slideToPx;
+    private TimeSpan _slideDuration;
+    private IEasingFunction _slideEase = OpenEase;
+    private Action? _slideDone;
+    private bool _slideRunning;
+
+    // Pending "compose at rest, then jump off-screen and slide in" step. See BeginReveal.
+    private EventHandler? _reveal;
+    private int _revealFrames;
 
     public PanelWindow(AppServices services, Action openSettings)
     {
@@ -56,11 +100,20 @@ internal sealed class PanelWindow : Window
 
         Title = "DreamTray";
         Width = PanelWidth;
+        // Somewhere harmless until the first ShowNear works out where the panel goes;
+        // the default (0,0) would flash in the corner of the primary monitor.
+        Left = -32000;
+        Top = -32000;
         SizeToContent = SizeToContent.Height;
         WindowStyle = WindowStyle.None;
         ResizeMode = ResizeMode.NoResize;
         ShowInTaskbar = false;
-        Topmost = true;
+        // Deliberately not topmost. The taskbar is, so leaving this window in the
+        // normal band is what puts it *under* the taskbar — the panel slides up out
+        // of it instead of across it, which is how every system tray flyout behaves.
+        // Nothing is lost by it: the panel is dismissed the moment it loses focus, so
+        // it is always the active window while on screen.
+        Topmost = false;
         // AllowsTransparency would disable the DWM backdrop and force software
         // rendering of the whole window; a solid themed background plus DWM's own
         // rounded corners gets the Windows 11 look without either cost.
@@ -81,12 +134,20 @@ internal sealed class PanelWindow : Window
         Deactivated += (_, _) => HidePanel();
         SizeChanged += OnSizeChanged;
         PreviewKeyDown += OnKeyDown;
-        SourceInitialized += (_, _) => ApplyWindowEffects();
+        SourceInitialized += OnSourceInitialized;
         _services.Theme.Changed += OnThemeChanged;
     }
 
     /// <summary>The placed widgets, for <c>--selftest</c> to drive add/remove through.</summary>
     internal WidgetManager Manager => _manager;
+
+    // Read per open and per close rather than cached: the settings window edits these
+    // live, and the panel is created once and reused for the life of the app.
+    private Settings.AnimationSettings Animations => _services.Settings.Current.Animations;
+    private TimeSpan OpenSlideTime => TimeSpan.FromMilliseconds(Animations.ClampedOpenMs);
+    private TimeSpan CloseSlideTime => TimeSpan.FromMilliseconds(Animations.ClampedCloseMs);
+    private bool AnimatesOpen => Animations.Enabled && Animations.ClampedOpenMs > 0;
+    private bool AnimatesClose => Animations.Enabled && Animations.ClampedCloseMs > 0;
 
     /// <summary>
     /// How many cards failed to build in the last rebuild. A failure is contained
@@ -341,6 +402,20 @@ internal sealed class PanelWindow : Window
     /// <summary>Position next to the tray icon and show.</summary>
     public void ShowNear(Rect iconRect)
     {
+        // Cancel a close that is still playing, otherwise its Completed handler
+        // would hide the panel we are in the middle of reopening.
+        StopAnimations();
+        // Cloak before showing, and lay the panel out at its *resting* position: a
+        // window only ever paints the part of itself that is on screen, so one that
+        // is shown off-screen and then slid in arrives with everything below the
+        // point it had reached still undefined. Cloaking lets it compose a complete
+        // frame where it belongs without the user seeing it happen; BeginReveal jumps
+        // it off-screen and starts the slide once that frame exists.
+        //
+        // With animation off none of that applies: the panel is shown where it belongs
+        // and stays there, which is also the only path that never needs the cloak.
+        bool animate = AnimatesOpen;
+        if (animate) WindowEffects.SetCloaked(this, true);
         Show();
         // Re-check the backdrop on every open: the user can switch transparency
         // effects on or off while the panel is alive, and the window is created
@@ -356,6 +431,7 @@ internal sealed class PanelWindow : Window
         ApplyPosition();
         Activate();
         _manager.SetPanelVisible(true);
+        if (animate) BeginReveal();
     }
 
     /// <summary>
@@ -367,12 +443,165 @@ internal sealed class PanelWindow : Window
 
     public void HidePanel()
     {
-        if (!IsVisible) return;
+        // _closing: the panel is still on screen playing its exit, so IsVisible is
+        // true and a second dismissal (a tray click landing on top of the Deactivated
+        // that started this one) would restart the animation from full opacity.
+        if (!IsVisible || _closing) return;
+        // Stamped when the dismissal starts rather than when the window actually
+        // disappears, so the reopen guard covers the exit animation too.
         LastHiddenTicks = Environment.TickCount64;
         foreach (var host in _list.Children.OfType<WidgetHost>()) host.CloseSettings();
         if (_addPopup != null) _addPopup.IsOpen = false;
-        _manager.SetPanelVisible(false);
-        Hide();
+
+        if (!AnimatesClose)
+        {
+            StopAnimations();
+            _manager.SetPanelVisible(false);
+            Hide();
+            return;
+        }
+        AnimateClose();
+    }
+
+    // ---------------------------------------------------------------- animation
+
+    /// <summary>
+    /// The Windows 11 flyout entrance: the panel starts completely outside the
+    /// monitor and travels the whole way to its resting position, emerging from
+    /// behind the taskbar. No fade — the shell does not fade these, and the taskbar
+    /// hiding the first part of the trip is what sells it.
+    /// </summary>
+    /// <summary>
+    /// Wait for the cloaked panel to compose one complete frame at its resting
+    /// position, then throw it off-screen, uncloak, and slide it back in.
+    ///
+    /// Two ticks, not one: CompositionTarget.Rendering fires *before* the frame it
+    /// belongs to is drawn, so the first one is still ahead of the paint being waited
+    /// on. The second means a full frame with the panel at rest has been composed.
+    /// That costs about 30 ms between the click and the panel moving, which is well
+    /// under what reads as a delay.
+    /// </summary>
+    private void BeginReveal()
+    {
+        CancelReveal();
+        _revealFrames = 0;
+        _reveal = (_, _) =>
+        {
+            if (++_revealFrames < 2) return;
+            CancelReveal();
+            WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
+            WindowEffects.SetCloaked(this, false);
+            AnimateOpen();
+        };
+        CompositionTarget.Rendering += _reveal;
+    }
+
+    private void CancelReveal()
+    {
+        if (_reveal != null) CompositionTarget.Rendering -= _reveal;
+        _reveal = null;
+    }
+
+    private void AnimateOpen()
+    {
+        _sliding = true;
+        StartSlide(_offscreenTopPx, _restTopPx, OpenSlideTime, OpenEase, () =>
+        {
+            _sliding = false;
+            // Not _restTopPx as captured at the start: the panel may have been
+            // re-anchored (a widget added) while the slide was running.
+            SettleAt();
+        });
+    }
+
+    /// <summary>
+    /// The exit: the same trip in reverse, back out of the monitor. Windows makes
+    /// this noticeably faster than the entrance — dismissal should feel immediate.
+    /// </summary>
+    private void AnimateClose()
+    {
+        // A dismissal landing inside the reveal window finds the panel still cloaked
+        // at its resting position, which is exactly where the exit starts from.
+        CancelReveal();
+        WindowEffects.SetCloaked(this, false);
+        _closing = true;
+        StartSlide(_restTopPx, _offscreenTopPx, CloseSlideTime, CloseEase, () =>
+        {
+            _closing = false;
+            _manager.SetPanelVisible(false);
+            Hide();
+            SettleAt();
+        });
+    }
+
+    /// <summary>
+    /// Move the window from one position to another over time, one step per rendered
+    /// frame.
+    ///
+    /// A WPF animation on the Top property would be the obvious way to do this, and
+    /// it is the wrong one: the property system converts through DIPs and re-enters
+    /// the window's own position handling on every tick, and the clock is not tied to
+    /// the frames that actually get presented. Over a travel this long that produces
+    /// uneven steps and half-drawn frames. CompositionTarget.Rendering fires exactly
+    /// once per composed frame, so each move lands on a frame that is about to be
+    /// shown, and the position comes from the wall clock rather than a frame count —
+    /// a dropped frame costs smoothness, never duration.
+    /// </summary>
+    private void StartSlide(
+        double fromPx, double toPx, TimeSpan duration, IEasingFunction ease, Action? done)
+    {
+        StopSlide();
+        _slideFromPx = fromPx;
+        _slideToPx = toPx;
+        _slideDuration = duration;
+        _slideEase = ease;
+        _slideDone = done;
+        _slideRunning = true;
+
+        WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(fromPx));
+        _slideClock.Restart();
+        CompositionTarget.Rendering += OnSlideFrame;
+    }
+
+    private void OnSlideFrame(object? sender, EventArgs e)
+    {
+        double total = _slideDuration.TotalMilliseconds;
+        double t = total <= 0 ? 1 : _slideClock.Elapsed.TotalMilliseconds / total;
+        bool finished = t >= 1;
+        if (finished) t = 1;
+
+        double y = _slideFromPx + (_slideToPx - _slideFromPx) * _slideEase.Ease(t);
+        WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(y));
+
+        if (!finished) return;
+        // Read the callback before stopping: StopSlide clears it, and it is what
+        // hides the window at the end of a close.
+        var done = _slideDone;
+        StopSlide();
+        done?.Invoke();
+    }
+
+    /// <summary>
+    /// Drop a slide in flight without running its completion. That is what keeps a
+    /// cancelled close from hiding a panel that has since been reopened.
+    /// </summary>
+    private void StopSlide()
+    {
+        if (_slideRunning) CompositionTarget.Rendering -= OnSlideFrame;
+        _slideRunning = false;
+        _slideClock.Reset();
+        _slideDone = null;
+    }
+
+    private void StopAnimations()
+    {
+        CancelReveal();
+        StopSlide();
+        _sliding = false;
+        _closing = false;
+        // Never leave the window cloaked: it would be invisible but still active, and
+        // the next dismissal would hide an already-invisible panel.
+        WindowEffects.SetCloaked(this, false);
     }
 
     private void SetAnchor(Rect iconRect)
@@ -416,28 +645,43 @@ internal sealed class PanelWindow : Window
     private void OnSizeChanged(object sender, SizeChangedEventArgs e)
     {
         if (_anchored && IsVisible) ApplyPosition();
-        // The clip region is in device pixels, so it has to be rebuilt for the new size.
-        ScheduleCornerRadius();
     }
 
     /// <summary>
-    /// Rebuild the rounded-corner clip once the HWND has actually taken its new
-    /// size. SizeChanged fires from the layout pass, but with SizeToContent the
-    /// window is resized after it вЂ” so building the region here would read the old
-    /// (shorter) window rect and clip the bottom of the panel away, silently
-    /// hiding whatever widgets did not fit the previous height.
+    /// Rebuild the rounded-corner clip from the size the window actually has.
+    ///
+    /// Driven off WM_WINDOWPOSCHANGED rather than SizeChanged: SizeChanged fires from
+    /// the layout pass, but with SizeToContent the HWND is resized after it, so a
+    /// region built there is cut to the *previous* height. Everything below that line
+    /// is clipped off the window — and since a shrinking region never invalidates
+    /// what it stops covering, the clipped widgets are left behind on the desktop as
+    /// a ghost of themselves.
+    ///
+    /// Comparing against the last size also makes this self-healing: the message
+    /// arrives on every frame of a slide too, so a region that has gone stale is
+    /// corrected on the next move instead of waiting for the next resize.
     /// </summary>
-    private void ScheduleCornerRadius()
+    private void UpdateCornerRadius()
     {
-        if (_cornerUpdateQueued) return;
-        _cornerUpdateQueued = true;
-        // Background runs after both Render and Loaded, which is where the resize
-        // and the reposition land.
-        Dispatcher.BeginInvoke(System.Windows.Threading.DispatcherPriority.Background, new Action(() =>
-        {
-            _cornerUpdateQueued = false;
-            WindowEffects.SetCornerRadius(this, CornerRadius);
-        }));
+        if (!WindowEffects.TryGetSize(this, out int width, out int height)) return;
+        if (width == _regionWidth && height == _regionHeight) return;
+        _regionWidth = width;
+        _regionHeight = height;
+        WindowEffects.SetCornerRadius(this, CornerRadius);
+    }
+
+    private void OnSourceInitialized(object? sender, EventArgs e)
+    {
+        if (PresentationSource.FromVisual(this) is System.Windows.Interop.HwndSource source)
+            source.AddHook(OnWindowMessage);
+        ApplyWindowEffects();
+    }
+
+    private nint OnWindowMessage(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
+    {
+        const int WM_WINDOWPOSCHANGED = 0x0047;
+        if (msg == WM_WINDOWPOSCHANGED) UpdateCornerRadius();
+        return nint.Zero;
     }
 
     private void ApplyPosition()
@@ -469,8 +713,38 @@ internal sealed class PanelWindow : Window
         top = Math.Max(workArea.Top + margin,
                        Math.Min(top, workArea.Bottom - heightPx - margin));
 
-        Left = left / scale;
-        Top = top / scale;
+        // The far end of the trip: outside the monitor, on the side the panel is
+        // docked against. Measured off the full monitor rather than the work area so
+        // the panel starts beyond the taskbar and slides out from under it, rather
+        // than starting on top of it.
+        //
+        // One pixel is deliberately left overlapping the screen, so the window never
+        // has zero intersection with the desktop while it is in flight.
+        Rect monitor = WindowEffects.GetMonitorArea(anchor);
+        double offscreen = taskbarAtTop ? monitor.Top - heightPx + 1 : monitor.Bottom - 1;
+
+        _leftPx = (int)Math.Round(left);
+        _restTopPx = top;
+        _offscreenTopPx = offscreen;
+        _restTop = top / scale;
+
+        // While a slide is running it owns the window position, and it moves the HWND
+        // directly. Assigning Left here would make WPF push its own stale cached Top
+        // along with it and yank the panel mid-flight, so a settled panel — and only a
+        // settled panel — is repositioned through the properties.
+        if (!_sliding && !_closing) SettleAt();
+    }
+
+    /// <summary>
+    /// Hand the window position back to WPF after a slide has moved the HWND behind
+    /// its back, so Left/Top agree with where the window actually is.
+    /// </summary>
+    private void SettleAt()
+    {
+        double scale = WindowEffects.GetDpiScale(this);
+        if (scale <= 0) scale = 1;
+        Left = _leftPx / scale;
+        Top = _restTop;
     }
 
     private void OnKeyDown(object sender, KeyEventArgs e)
@@ -483,9 +757,11 @@ internal sealed class PanelWindow : Window
     private void ApplyWindowEffects()
     {
         WindowEffects.SetDarkMode(this, _services.Theme.IsDark);
-        // Deferred for the same reason as OnSizeChanged: on an open the content has
-        // not been laid out yet, so the window rect is still the previous one.
-        ScheduleCornerRadius();
+        // SetCornerRadius also turns DWM's own rounding off, and TryApplyBackdrop
+        // below can put it back, so force the region to be rebuilt rather than
+        // trusting the cached size.
+        _regionWidth = _regionHeight = -1;
+        UpdateCornerRadius();
 
         // Acrylic is the material Windows uses for its own tray flyouts. If DWM
         // refuses it вЂ” an older build, or transparency effects switched off вЂ” the
@@ -514,6 +790,10 @@ internal sealed class PanelWindow : Window
 
     protected override void OnClosed(EventArgs e)
     {
+        // CompositionTarget.Rendering is static, so a slide or a pending reveal left
+        // running here would keep the closed window alive and moving.
+        CancelReveal();
+        StopSlide();
         _services.Theme.Changed -= OnThemeChanged;
         _manager.LayoutChanged -= RebuildList;
         _manager.Dispose();

@@ -9,8 +9,8 @@ using DreamTray.Theme;
 namespace DreamTray.App.Views;
 
 /// <summary>
-/// The full settings window: start-up, appearance, the APU power policy and the
-/// plugin list.
+/// The full settings window: start-up, appearance, panel animation, the APU power
+/// policy and the plugin list.
 ///
 /// Everything here edits the same state the widgets do — the TDP page and the TDP
 /// widget's flyout write the same <see cref="Settings.TdpSettings"/> — so there is
@@ -24,10 +24,11 @@ internal sealed class SettingsWindow : Window
 
     private static readonly (string Key, string Glyph, string Label)[] Pages =
     [
-        ("general",  "\uE713", "General"),
-        ("power",    "\uE945", "Power"),
-        ("plugins",  "\uEA86", "Plugins"),
-        ("about",    "\uE946", "About"),
+        ("general",    "\uE713", "General"),
+        ("animations", "\uE916", "Animations"),
+        ("power",      "\uE945", "Power"),
+        ("plugins",    "\uEA86", "Plugins"),
+        ("about",      "\uE946", "About"),
     ];
 
     public SettingsWindow(AppServices services)
@@ -57,6 +58,12 @@ internal sealed class SettingsWindow : Window
         };
         _services.Theme.Changed += OnThemeChanged;
     }
+
+    /// <summary>Every page key, for <c>--selftest</c> to build each one in turn.</summary>
+    internal static IEnumerable<string> PageKeys => Pages.Select(p => p.Key);
+
+    /// <summary>Switch pages, for <c>--selftest</c>.</summary>
+    internal void ShowPage(string key) => Select(key);
 
     private UIElement BuildLayout()
     {
@@ -119,6 +126,7 @@ internal sealed class SettingsWindow : Window
 
         _content.Content = key switch
         {
+            "animations" => BuildAnimationsPage(),
             "power" => BuildPowerPage(),
             "plugins" => BuildPluginsPage(),
             "about" => BuildAboutPage(),
@@ -183,6 +191,57 @@ internal sealed class SettingsWindow : Window
             Section("Files",
                 Ui.LabelRow("Settings and log", Ui.Button("Open folder", () =>
                     OpenPath(Settings.SettingsStore.Folder)))));
+    }
+
+    private UIElement BuildAnimationsPage()
+    {
+        var config = _services.Settings.Current.Animations;
+        void Save() => _services.Settings.Save();
+
+        // Rebuilding the page on toggle is what greys the duration fields out; the
+        // panel itself re-reads these on every open, so nothing needs telling.
+        var enabled = Ui.Switch(config.Enabled, v =>
+        {
+            config.Enabled = v;
+            Save();
+            Select("animations");
+        });
+
+        var openMs = Ui.Number(config.OpenMs, 0, Settings.AnimationSettings.MaxMs,
+                               v => { config.OpenMs = v; Save(); });
+        var closeMs = Ui.Number(config.CloseMs, 0, Settings.AnimationSettings.MaxMs,
+                                v => { config.CloseMs = v; Save(); });
+
+        var reset = Ui.Button("Restore defaults", () =>
+        {
+            config.Enabled = true;
+            config.OpenMs = Settings.AnimationSettings.DefaultOpenMs;
+            config.CloseMs = Settings.AnimationSettings.DefaultCloseMs;
+            Save();
+            Select("animations");
+        });
+
+        var timing = Section("Duration",
+            Ui.LabelRow("Opening (ms)", openMs),
+            Ui.LabelRow("Closing (ms)", closeMs),
+            Ui.Caption($"Defaults are {Settings.AnimationSettings.DefaultOpenMs} ms in and " +
+                       $"{Settings.AnimationSettings.DefaultCloseMs} ms out, which is about what " +
+                       "Windows uses for its own tray flyouts. The panel travels a whole screen " +
+                       "height, so much below 200 ms starts to look like a jump rather than a " +
+                       "slide. 0 turns that direction off on its own."),
+            reset);
+
+        // Disabled rather than hidden: the values stay readable, and the page does not
+        // change height when the switch is flipped.
+        timing.IsEnabled = config.Enabled;
+
+        return Ui.Stack(
+            Section("Panel",
+                Ui.LabelRow("Animate the panel", enabled),
+                Ui.Caption("The panel slides in from beyond the screen edge and out again the same " +
+                           "way, passing under the taskbar. Turned off, it simply appears and " +
+                           "disappears at its resting position.")),
+            timing);
     }
 
     private UIElement BuildPowerPage()

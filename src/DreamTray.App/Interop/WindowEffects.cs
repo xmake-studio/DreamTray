@@ -17,6 +17,7 @@ internal static class WindowEffects
 {
     private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
     private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
+    private const int DWMWA_CLOAK = 13;
     private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
 
     private const int DWMWCP_DONOTROUND = 1;
@@ -140,21 +141,75 @@ internal static class WindowEffects
     }
 
     /// <summary>Work area (excluding the taskbar) of the monitor under a screen point, in pixels.</summary>
-    public static Rect GetWorkArea(Point screenPoint)
+    public static Rect GetWorkArea(Point screenPoint) => MonitorRect(screenPoint, work: true);
+
+    /// <summary>
+    /// Full bounds of the monitor under a screen point, in pixels — the work area
+    /// plus whatever the taskbar occupies. A flyout that has to start off-screen
+    /// measures against this, not the work area: the taskbar edge is where it should
+    /// appear to come from, not where it should start.
+    /// </summary>
+    public static Rect GetMonitorArea(Point screenPoint) => MonitorRect(screenPoint, work: false);
+
+    private static Rect MonitorRect(Point screenPoint, bool work)
     {
         var pt = new POINT { X = (int)screenPoint.X, Y = (int)screenPoint.Y };
         nint monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
         var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
         if (monitor == nint.Zero || !GetMonitorInfo(monitor, ref info))
             return new Rect(0, 0, 1920, 1080);
-        var w = info.rcWork;
-        return new Rect(w.left, w.top, w.right - w.left, w.bottom - w.top);
+        var r = work ? info.rcWork : info.rcMonitor;
+        return new Rect(r.left, r.top, r.right - r.left, r.bottom - r.top);
     }
 
     public static Point GetCursorPosition()
     {
         GetCursorPos(out POINT p);
         return new Point(p.X, p.Y);
+    }
+
+    /// <summary>Outer size of a window in device pixels, straight from the OS.</summary>
+    public static bool TryGetSize(Window window, out int width, out int height)
+    {
+        width = height = 0;
+        nint hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == nint.Zero || !GetWindowRect(hwnd, out RECT rect)) return false;
+        width = rect.right - rect.left;
+        height = rect.bottom - rect.top;
+        return width > 0 && height > 0;
+    }
+
+    /// <summary>
+    /// Move a window, in device pixels, without going through WPF's Left/Top.
+    /// Those convert through DIPs and run the property system on every change, which
+    /// is too much per-frame overhead for a slide; this is the bare SetWindowPos.
+    ///
+    /// Note the absence of NOCOPYBITS. That flag tells Windows to discard the client
+    /// area and invalidate all of it instead of moving the pixels it already has —
+    /// which is fatal for a window travelling in from off-screen, because the parts
+    /// still outside the monitor cannot be repainted and so end up undefined.
+    /// Letting the bits move with the window is what keeps it whole.
+    /// </summary>
+    public static void MoveTo(Window window, int xPixels, int yPixels)
+    {
+        nint hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == nint.Zero) return;
+        SetWindowPos(hwnd, nint.Zero, xPixels, yPixels, 0, 0,
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+
+    /// <summary>
+    /// Hide a window from the screen while leaving it fully live: still visible to
+    /// the window manager, still laid out, still painting. This is what the shell
+    /// uses for windows on other virtual desktops, and it is the only way to let a
+    /// window compose a complete frame at a position the user must not see it in.
+    /// </summary>
+    public static void SetCloaked(Window window, bool cloaked)
+    {
+        nint hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == nint.Zero) return;
+        int value = cloaked ? 1 : 0;
+        DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, ref value, sizeof(int));
     }
 
     /// <summary>Scale factor of the monitor a window is on (1.0 at 96 DPI).</summary>
@@ -167,6 +222,11 @@ internal static class WindowEffects
     // ---------------------------------------------------------------- interop
 
     private const int MONITOR_DEFAULTTONEAREST = 2;
+
+    private const int SWP_NOSIZE = 0x0001;
+    private const int SWP_NOZORDER = 0x0004;
+    private const int SWP_NOACTIVATE = 0x0010;
+    private const int SWP_NOOWNERZORDER = 0x0200;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MARGINS { public int Left, Right, Top, Bottom; }
@@ -203,6 +263,10 @@ internal static class WindowEffects
 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(nint hwnd, out RECT rect);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetWindowPos(
+        nint hwnd, nint insertAfter, int x, int y, int cx, int cy, int flags);
 
     [DllImport("user32.dll")]
     private static extern int SetWindowRgn(nint hwnd, nint region, bool redraw);

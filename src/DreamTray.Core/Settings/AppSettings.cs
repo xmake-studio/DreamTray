@@ -20,6 +20,8 @@ public sealed class AppSettings
 
     public TdpSettings Tdp { get; set; } = new();
 
+    public AnimationSettings Animations { get; set; } = new();
+
     /// <summary>Widgets on the panel, in display order.</summary>
     public List<WidgetPlacement> Widgets { get; set; } = [];
 
@@ -28,6 +30,30 @@ public sealed class AppSettings
 
     /// <summary>Set once the first run has seeded the default widget set.</summary>
     public bool Initialised { get; set; }
+}
+
+/// <summary>
+/// How the panel enters and leaves the screen. Durations are in milliseconds and
+/// capped well above anything usable, so a hand-edited settings file cannot leave
+/// the panel crawling for a minute with no way to reach the setting that fixes it.
+/// </summary>
+public sealed class AnimationSettings
+{
+    public const int DefaultOpenMs = 350;
+    public const int DefaultCloseMs = 200;
+    public const int MaxMs = 2000;
+
+    /// <summary>Off means the panel simply appears and disappears at its resting position.</summary>
+    public bool Enabled { get; set; } = true;
+
+    /// <summary>Travel time of the slide in, in ms. 0 is treated as off.</summary>
+    public int OpenMs { get; set; } = DefaultOpenMs;
+
+    /// <summary>Travel time of the slide out, in ms. 0 is treated as off.</summary>
+    public int CloseMs { get; set; } = DefaultCloseMs;
+
+    public int ClampedOpenMs => Math.Clamp(OpenMs, 0, MaxMs);
+    public int ClampedCloseMs => Math.Clamp(CloseMs, 0, MaxMs);
 }
 
 public sealed class TdpSettings

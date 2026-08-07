@@ -161,6 +161,18 @@ internal static class SelfTest
             settings.UpdateLayout();
         });
 
+        // Only the landing page is built by the constructor, so a page that throws on
+        // build stays invisible until someone clicks its nav entry.
+        Check("every settings page builds", () =>
+        {
+            if (settings == null) throw new InvalidOperationException("no settings window to exercise");
+            foreach (string key in SettingsWindow.PageKeys)
+            {
+                settings.ShowPage(key);
+                settings.UpdateLayout();
+            }
+        });
+
         if (screenshotDir != null)
         {
             Check("render screenshots", () =>
