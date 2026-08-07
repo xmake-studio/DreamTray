@@ -32,6 +32,17 @@ public partial class App : Application
             return;
         }
 
+        // `--tdp-probe` writes a limit and samples the readback, to tell an override
+        // by the EC apart from a write that never lands.
+        int tdpProbe = Array.IndexOf(e.Args, "--tdp-probe");
+        if (tdpProbe >= 0)
+        {
+            int watts = tdpProbe + 1 < e.Args.Length && int.TryParse(e.Args[tdpProbe + 1], out int w) ? w : 22;
+            TdpProbe.Run(watts);
+            Shutdown();
+            return;
+        }
+
         int setBrightness = Array.IndexOf(e.Args, "--set-brightness");
         if (setBrightness >= 0 && setBrightness + 2 < e.Args.Length &&
             int.TryParse(e.Args[setBrightness + 2], out int percent))

@@ -36,7 +36,7 @@ missing widget, not an error.
 
 | Feature | Works on |
 |---|---|
-| APU power limit (TDP) | AMD Ryzen only, and only where **RyzenAdj** supports the SMU generation — in practice Zen and newer mobile/desktop Ryzen. Needs the RyzenAdj files (below), administrator rights, and Memory Integrity turned off. Intel is not supported; there is no equivalent backend. The slider's range is measured from your own firmware on first launch, not assumed. |
+| APU power limit (TDP) | AMD Ryzen only, Raven Ridge and newer — the SMU command set is mapped per generation and an unrecognised part disables the slider rather than guessing. Needs the [PawnIO](https://pawnio.eu) driver (below) and administrator rights; Memory Integrity can stay on. Intel is not supported; there is no equivalent backend. The slider's range is measured from your own firmware on first launch, not assumed. |
 | Temperatures, clocks, load, component power | Anything LibreHardwareMonitor can read — Intel and AMD CPUs, NVIDIA/AMD/Intel GPUs. Individual rows read "—" where a chip exposes no such sensor. The GPU/SoC power row is derived as package-minus-cores, which is meaningful on an APU and less so on a system with a discrete GPU. |
 | Brightness | Built-in laptop panels via the ACPI/WMI backlight interface; external monitors via DDC/CI, which most desktop monitors support over DisplayPort/HDMI but some refuse. |
 | Battery, and every "on battery / on charger" rule | Laptops and tablets. **On a desktop these do not appear at all** — no Battery widget, no battery row in Component power, no per-power-source TDP defaults, no automatic theme or refresh-rate switching. |
@@ -100,11 +100,21 @@ Turn on **Settings → General → Start DreamTray when I sign in**. That regist
 Task Scheduler logon task with highest privileges, which starts elevated *without*
 a UAC prompt at every logon — a Run-key shortcut cannot do that.
 
-### TDP control needs RyzenAdj
+### TDP control needs the PawnIO driver
 
-Drop `libryzenadj.dll`, `WinRing0x64.dll` and `WinRing0x64.sys` into `native\`.
-See [`src/DreamTray.App/native/README.md`](src/DreamTray.App/native/README.md).
-Without them the TDP widget hides itself and everything else works.
+Install [PawnIO](https://pawnio.eu) once — that is the whole setup, no files to
+copy. The SMU module blob ships inside LibreHardwareMonitor, which DreamTray
+already depends on. See
+[`src/DreamTray.App/native/README.md`](src/DreamTray.App/native/README.md) for
+the details and for how to override the bundled module.
+
+Without PawnIO the TDP widget hides itself and everything else works.
+
+PawnIO replaced WinRing0 here deliberately: WinRing0 is on Microsoft's
+vulnerable-driver blocklist, and anti-cheats (Easy Anti-Cheat, BattlEye,
+Vanguard) refuse to run alongside a process holding it. PawnIO runs signed
+kernel-side modules that expose only the SMU mailbox, so DreamTray can stay
+running while you play.
 
 ### Diagnostics
 
@@ -114,8 +124,19 @@ DreamTray.exe --dump
 
 Prints every sensor LibreHardwareMonitor can see (with the raw names the mapping
 code keys off), the enumerated displays and their brightness, the display modes,
-and the state of the RyzenAdj backend. This is the first thing to run when a
+and the state of the PawnIO/SMU backend. This is the first thing to run when a
 reading is missing.
+
+```bash
+DreamTray.exe --tdp-probe 22
+```
+
+Writes the given limit and then samples the power table on a tight schedule, to
+answer the question a stuck TDP slider raises: did the write never take effect, or
+did it take effect and then get overwritten? A single before/after reading cannot
+tell those apart. Phase 1 writes once and watches; phase 2 re-applies every 250 ms
+to see whether a faster loop would hold the limit against something re-asserting
+it. Needs elevation, and the tray app closed — it holds the SMU handle.
 
 ```bash
 DreamTray.exe --selftest
@@ -163,7 +184,7 @@ src/
   DreamTray.Core/        Hardware access, settings, plugin loader. No app UI.
     Sensors/             SensorService (LHM) + PDH/NT readers + SensorSampler.
     Display/             BrightnessService (WMI + DDC/CI), DisplayModeService.
-    Power/               RyzenAdj interop, TdpService (limit + policy),
+    Power/               PawnIO/SMU interop, TdpService (limit + policy),
                          PowerPolicyService (standby timeout, lid action).
     Theme/               Windows theme tracking and switching.
     Startup/             Logon task registration.

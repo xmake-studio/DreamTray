@@ -2,7 +2,8 @@ bin/
 obj/
 dist/
 
-# RyzenAdj is not redistributed here — see src/DreamTray.App/native/README.md
+# PawnIO module blobs are not redistributed here — see src/DreamTray.App/native/README.md
+native/*.bin
 native/*.dll
 native/*.sys
 

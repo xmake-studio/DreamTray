@@ -12,11 +12,11 @@ namespace DreamTray.Power;
 /// power-source changes and on its own timers, so DreamTray re-asserts them.
 ///
 /// Everything is a no-op when <see cref="IsAvailable"/> is false, so the rest of
-/// the app never has to special-case a machine without RyzenAdj.
+/// the app never has to special-case a machine without PawnIO.
 /// </summary>
 public sealed class TdpService : ITdpControl, IDisposable
 {
-    private readonly RyzenAdjInterop _adj = new();
+    private readonly PawnIoSmu _adj = new();
     private readonly Action<string> _log;
     private readonly object _gate = new();
 
@@ -73,7 +73,7 @@ public sealed class TdpService : ITdpControl, IDisposable
     /// Work out sensible slider bounds for whatever chip this actually is, from the
     /// limits the firmware is running with right now.
     ///
-    /// There is no "what is this part rated for" query — RyzenAdj exposes the live
+    /// There is no "what is this part rated for" query — the SMU exposes the live
     /// power table and nothing else — so the highest of the three configured limits
     /// (STAPM, slow, fast) stands in for the top of the range. That is the number the
     /// OEM decided this chassis can cool, which is the honest ceiling anyway: a

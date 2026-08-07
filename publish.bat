@@ -36,8 +36,8 @@ echo.
 echo Done: dist\DreamTray.exe
 echo.
 echo Next steps:
-echo   * For the TDP slider, drop libryzenadj.dll + WinRing0x64.dll/.sys into dist\native\
-echo     (see dist\native\README.md).
+echo   * For the TDP slider, install the PawnIO driver from https://pawnio.eu
+echo     (no files to copy — see dist\native\README.md).
 echo   * Run dist\DreamTray.exe, then turn on Settings ^> General ^> start at sign-in.
 echo.
 

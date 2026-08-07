@@ -38,6 +38,35 @@ internal sealed class TdpWidget : WidgetBase
         // The concrete service is needed for the policy properties; the interface
         // deliberately exposes only the parts a plugin should touch.
         _service = (context.Host.Hardware.Tdp as Power.TdpService);
+
+        // A manual slider move stands until the power source changes, at which point
+        // the policy applies that source's default. When that happens with the panel
+        // already open, the slider has to follow — otherwise it keeps showing the
+        // overridden value while the chip is running at the new default.
+        if (_service != null) _service.LimitChangedByPolicy += OnLimitChangedByPolicy;
+    }
+
+    /// <summary>Raised off the UI thread, from a timer or a power-event continuation.</summary>
+    private void OnLimitChangedByPolicy(int watts)
+    {
+        _slider?.Dispatcher.BeginInvoke(() => ShowWithoutApplying(watts));
+    }
+
+    /// <summary>Move the slider to a value the service already applied, without re-applying it.</summary>
+    private void ShowWithoutApplying(int watts)
+    {
+        if (_slider == null || Math.Abs(_slider.Value - watts) <= 0.5) return;
+
+        _suppress = true;
+        _slider.Value = watts;
+        if (_value != null) _value.Text = $"{watts} W";
+        _suppress = false;
+    }
+
+    public override void Dispose()
+    {
+        if (_service != null) _service.LimitChangedByPolicy -= OnLimitChangedByPolicy;
+        base.Dispose();
     }
 
     public override string Title => "APU power limit";
@@ -123,13 +152,7 @@ internal sealed class TdpWidget : WidgetBase
     {
         // The policy may have moved the limit while the panel was closed.
         int applied = Hardware.Tdp?.AppliedWatts ?? 0;
-        if (applied > 0 && _slider != null && Math.Abs(_slider.Value - applied) > 0.5)
-        {
-            _suppress = true;
-            _slider.Value = applied;
-            if (_value != null) _value.Text = $"{applied} W";
-            _suppress = false;
-        }
+        if (applied > 0) ShowWithoutApplying(applied);
     }
 
     public override FrameworkElement? CreateSettingsView()

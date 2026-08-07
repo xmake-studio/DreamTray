@@ -72,7 +72,7 @@ public sealed class AppServices : IDisposable
             Log.Write($"tdp: detected range {probed.Min}–{probed.Max} W, using {min}–{max} W");
         }
 
-        // Nothing to probe (no RyzenAdj, or an unreadable power table) and nothing
+        // Nothing to probe (no PawnIO, or an unreadable power table) and nothing
         // stored: fall back rather than leaving a zero-width slider.
         if (min <= 0) min = TdpService.FallbackMinWatts;
         if (max <= min) max = Math.Max(TdpService.FallbackMaxWatts, min + 5);

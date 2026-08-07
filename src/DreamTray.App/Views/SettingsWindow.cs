@@ -254,8 +254,8 @@ internal sealed class SettingsWindow : Window
             return Ui.Stack(Section("APU power limit",
                 Ui.Body("Not available on this machine."),
                 Ui.Caption(tdp.StatusText),
-                Ui.Caption("DreamTray drives the limit through RyzenAdj. Put libryzenadj.dll and " +
-                           "WinRing0x64.sys/.dll in the app's native\\ folder and restart. " +
+                Ui.Caption("DreamTray drives the limit through the PawnIO driver. Install PawnIO, " +
+                           "put RyzenSMU.bin in the app's native\\ folder and restart. " +
                            "See native\\README.md.")));
         }
 
@@ -386,7 +386,7 @@ internal sealed class SettingsWindow : Window
                 Ui.Caption($"Running elevated: {Startup.AutostartService.IsElevated}"),
                 Ui.Caption("Sensor data comes from LibreHardwareMonitor plus native performance " +
                            "counters; brightness from the ACPI backlight interface and DDC/CI; " +
-                           "the power limit from RyzenAdj.")),
+                           "the power limit from the AMD SMU via PawnIO.")),
             Section("Diagnostics",
                 Ui.Caption("Run DreamTray.exe --dump from a console to print every detected sensor " +
                            "and the state of each backend. That is the fastest way to find out why " +

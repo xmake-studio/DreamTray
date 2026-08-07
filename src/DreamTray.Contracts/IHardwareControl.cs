@@ -112,7 +112,7 @@ public sealed record DisplayMode(int Width, int Height, int RefreshHz)
 /// <summary>APU sustained/boost power limits, in watts.</summary>
 public interface ITdpControl
 {
-    /// <summary>Human-readable backend state, e.g. "RyzenAdj ready (family 25)" or why it is unavailable.</summary>
+    /// <summary>Human-readable backend state, e.g. "PawnIO ready (Phoenix, PM table 004C0007)" or why it is unavailable.</summary>
     string StatusText { get; }
     bool IsAvailable { get; }
 
