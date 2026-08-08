@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 using DreamTray.Theme;
 
@@ -8,7 +8,7 @@ internal sealed class ThemeWidgetFactory : IWidgetFactory
 {
     public const string Id = "core.theme";
     public string TypeId => Id;
-    public string DisplayName => "Theme";
+    public string DisplayName => "Dark theme";
     public string Description => "Switch Windows between light and dark, optionally on power source.";
     public string Glyph => "\uE793";
     public IWidget Create(IWidgetContext context) => new ThemeWidget(context);
@@ -28,7 +28,9 @@ internal sealed class ThemeWidget(IWidgetContext context) : WidgetBase(context)
     private bool _suppress;
     private bool? _lastOnAc;
 
-    public override string Title => "Theme";
+    // The title carries the switch's meaning: with the toggle on the title row there
+    // is no label of its own to say which way is which.
+    public override string Title => "Dark theme";
 
     /// <summary>What to do with the Windows theme when the power source changes.</summary>
     private enum ThemeAction { None, Dark, Light }
@@ -56,21 +58,36 @@ internal sealed class ThemeWidget(IWidgetContext context) : WidgetBase(context)
         Storage.Get("autoLightOnBattery", false) && Storage.Get("restoreOnCharger", true)
             ? ThemeAction.Dark : ThemeAction.None;
 
-    protected override FrameworkElement BuildView()
+    /// <summary>
+    /// The whole widget is one switch, so it rides on the title row: "Theme" plus a
+    /// toggle says everything a labelled row below would, in half the height.
+    /// </summary>
+    public override FrameworkElement? HeaderAccessory
     {
-        _toggle = Ui.Switch(Host.Theme.IsDark, dark =>
+        get
         {
-            if (_suppress) return;
-            Hardware.SetWindowsDarkMode(dark);
-        });
+            if (_toggle == null)
+            {
+                _toggle = Ui.Switch(Host.Theme.IsDark, dark =>
+                {
+                    if (_suppress) return;
+                    Hardware.SetWindowsDarkMode(dark);
+                });
+                _toggle.ToolTip = "Dark mode";
 
-        var row = Ui.LabelRow("Dark mode", _toggle);
-
-        // Keep the switch honest if the theme changes from anywhere else.
-        Host.Theme.Changed += SyncFromSystem;
-
-        return Ui.Stack(row);
+                // Keep the switch honest if the theme changes from anywhere else.
+                Host.Theme.Changed += SyncFromSystem;
+            }
+            return _toggle;
+        }
     }
+
+    /// <summary>
+    /// No body: the switch is in the header. Collapsed rather than empty so the card
+    /// drops the gap it would otherwise leave under the title.
+    /// </summary>
+    protected override FrameworkElement BuildView() =>
+        new StackPanel { Visibility = Visibility.Collapsed };
 
     private void SyncFromSystem()
     {
@@ -123,7 +140,7 @@ internal sealed class ThemeWidget(IWidgetContext context) : WidgetBase(context)
         {
             Ui.Caption("The switch above changes the Windows theme. This app can follow it or " +
                        "stay pinned to one appearance."),
-            Ui.LabelRow("DreamTray appearance", appPreference),
+            Ui.LabelRow("DreamTray theme", appPreference),
         };
 
         // A desktop never changes power source, so the rule could never fire.

@@ -11,9 +11,28 @@ namespace DreamTray.App.Widgets.BuiltIn;
 internal abstract class MetricWidget(IWidgetContext context) : WidgetBase(context)
 {
     private readonly List<TextBlock> _valueBlocks = [];
+    private TextBlock? _headerValue;
 
     /// <summary>The rows to show, top to bottom.</summary>
     protected abstract IReadOnlyList<MetricRow> Rows { get; }
+
+    /// <summary>
+    /// Optional single readout promoted to the title row. Worth it only where one
+    /// value is plainly the headline and the rest are detail — a widget whose rows
+    /// are peers reads as broken with one of them lifted out.
+    /// </summary>
+    protected virtual MetricRow? HeaderRow => null;
+
+    public override FrameworkElement? HeaderAccessory
+    {
+        get
+        {
+            if (HeaderRow == null) return null;
+            _headerValue ??= Ui.Caption("—");
+            _headerValue.TextWrapping = TextWrapping.NoWrap;
+            return _headerValue;
+        }
+    }
 
     protected override bool NeedsSensors => true;
 
@@ -33,6 +52,12 @@ internal abstract class MetricWidget(IWidgetContext context) : WidgetBase(contex
 
     protected override void OnSample(SystemSnapshot snapshot)
     {
+        if (_headerValue != null && HeaderRow is { } header)
+        {
+            try { _headerValue.Text = header.Format(snapshot); }
+            catch { _headerValue.Text = "—"; }
+        }
+
         var rows = Rows;
         for (int i = 0; i < _valueBlocks.Count && i < rows.Count; i++)
         {

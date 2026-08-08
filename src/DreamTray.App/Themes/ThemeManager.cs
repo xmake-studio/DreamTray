@@ -27,17 +27,24 @@ internal static class ThemeManager
         // white over an unknown backdrop — layering 5% white on whatever showed
         // through was what made everything read as flat grey.
         Set(resources, "WindowBackground", dark
-            ? Rgba(0x20, 0x20, 0x20, translucent ? (byte)0xF2 : (byte)0xFF)
-            : Rgba(0xF3, 0xF3, 0xF3, translucent ? (byte)0xF2 : (byte)0xFF));
+            ? Rgba(0x1A, 0x1A, 0x1A, translucent ? (byte)0xF2 : (byte)0xFF)
+            : Rgba(0xEE, 0xEE, 0xEE, translucent ? (byte)0xF2 : (byte)0xFF));
+
+        // The hairline around the panel itself. Unlike the cards this one *is* a
+        // light stroke on dark: the panel floats over the desktop rather than over
+        // another surface, so it needs the edge to separate it from whatever is behind.
+        Set(resources, "WindowStroke", dark
+            ? Rgba(0xFF, 0xFF, 0xFF, 0x1F)
+            : Rgba(0x00, 0x00, 0x00, 0x1F));
 
         // Card — every widget sits on one of these. Clearly lighter than the window
         // in dark mode and clearly closer to white in light mode, which is what
         // gives the Settings app its sense of depth.
         Set(resources, "CardBackground", dark
-            ? Rgba(0x2D, 0x2D, 0x2D, 0xFF)
+            ? Rgba(0x26, 0x26, 0x26, 0xFF)
             : Rgba(0xFB, 0xFB, 0xFB, 0xFF));
         Set(resources, "CardBackgroundHover", dark
-            ? Rgba(0x32, 0x32, 0x32, 0xFF)
+            ? Rgba(0x2C, 0x2C, 0x2C, 0xFF)
             : Rgba(0xFF, 0xFF, 0xFF, 0xFF));
         // WinUI draws card edges with a dark stroke in both themes; a white stroke
         // on dark haloes the card and reads as grey haze rather than an edge.
@@ -86,7 +93,7 @@ internal static class ThemeManager
         // Flyouts and tooltips sit above the window, so they need their own
         // slightly lighter surface rather than inheriting the window colour.
         Set(resources, "FlyoutBackground", dark
-            ? Rgba(0x2C, 0x2C, 0x2C, 0xFF)
+            ? Rgba(0x26, 0x26, 0x26, 0xFF)
             : Rgba(0xF9, 0xF9, 0xF9, 0xFF));
 
         // Accent.

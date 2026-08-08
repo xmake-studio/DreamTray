@@ -57,7 +57,7 @@ and wasn't detected.
 |---|---|
 | Brightness | One slider per display. Built-in panel via the ACPI backlight interface, external monitors via DDC/CI. Optional "move all together". |
 | APU power limit | Sustained TDP slider showing live system and APU draw underneath. The range is detected from your own silicon. Settings: re-apply interval and, on a laptop, separate charger/battery defaults. |
-| Theme | Flips the **Windows** light/dark setting. On a laptop, optionally go light on battery and back to dark on the charger. |
+| Dark theme | Flips the **Windows** light/dark setting. On a laptop, optionally go light on battery and back to dark on the charger. |
 | Battery *(laptops only)* | Charge level, power source, time to empty or full. |
 | Temperatures | CPU and GPU. |
 | Clocks | CPU average/peak core clock, GPU clock. |

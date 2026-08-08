@@ -103,6 +103,12 @@ internal sealed class WidgetHost : Border
             body.Content = Ui.Caption("This widget failed to load. See the log for details.");
         }
 
+        // A widget whose whole control fits in the header (the theme switch) hands back
+        // a collapsed body; without this the card would keep the gap under the title
+        // and the row it saved would come straight back as padding.
+        if (body.Content is UIElement { Visibility: Visibility.Collapsed })
+            header.Margin = new Thickness(0);
+
         var stack = new StackPanel();
         stack.Children.Add(header);
         stack.Children.Add(body);
@@ -219,6 +225,9 @@ internal sealed class WidgetHost : Border
             Background = Application.Current?.TryFindResource("FlyoutBackground") as Brush,
             Child = content,
         };
+        // Same reasoning as the add-widget popup: a floating surface gets the light
+        // hairline, not the dark card stroke.
+        card.SetResourceReference(Border.BorderBrushProperty, "WindowStroke");
 
         _settingsPopup = new Popup
         {

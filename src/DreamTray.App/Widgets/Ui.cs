@@ -24,8 +24,19 @@ internal static class Ui
     public static TextBlock Caption(string text) =>
         new() { Text = text, Style = Find("CaptionText"), TextWrapping = TextWrapping.Wrap };
 
+    /// <summary>
+    /// A right-hand readout. Centred vertically because it is usually placed beside a
+    /// slider, which is taller than the text — a stretched TextBlock draws its line at
+    /// the top of the cell and reads as if it were floating above the control.
+    /// </summary>
     public static TextBlock Value(string text) =>
-        new() { Text = text, Style = Find("ValueText"), HorizontalAlignment = HorizontalAlignment.Right };
+        new()
+        {
+            Text = text,
+            Style = Find("ValueText"),
+            HorizontalAlignment = HorizontalAlignment.Right,
+            VerticalAlignment = VerticalAlignment.Center,
+        };
 
     public static TextBlock Glyph(string glyph, double size = 16) =>
         new() { Text = glyph, Style = Find("GlyphText"), FontSize = size };

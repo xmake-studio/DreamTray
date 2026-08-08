@@ -71,6 +71,22 @@ internal sealed class TdpWidget : WidgetBase
 
     public override string Title => "APU power limit";
 
+    /// <summary>
+    /// The live draw sits on the title row rather than under the slider: it is a
+    /// readout about the widget, not a control, and a line of its own costs height
+    /// for a handful of characters.
+    /// </summary>
+    public override FrameworkElement? HeaderAccessory
+    {
+        get
+        {
+            if (Hardware.Tdp == null) return null;
+            _status ??= Ui.Caption("");
+            _status.TextWrapping = TextWrapping.NoWrap;
+            return _status;
+        }
+    }
+
     protected override bool NeedsSensors => true;
     protected override TimeSpan SampleInterval => TimeSpan.FromSeconds(2);
 
@@ -96,7 +112,8 @@ internal sealed class TdpWidget : WidgetBase
         _value.MinWidth = 44;
 
         _slider = Ui.Slider(min, max, current, v => Apply((int)v));
-        _slider.Margin = new Thickness(0, 2, 8, 0);
+        _slider.Margin = new Thickness(0, 0, 8, 0);
+        _slider.VerticalAlignment = VerticalAlignment.Center;
 
         var grid = new Grid();
         grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });
@@ -106,10 +123,9 @@ internal sealed class TdpWidget : WidgetBase
         grid.Children.Add(_slider);
         grid.Children.Add(_value);
 
-        _status = Ui.Caption("");
-        _status.Margin = new Thickness(0, 4, 0, 0);
-
-        return Ui.Stack(grid, _status);
+        // The status caption lives in the title row (see HeaderAccessory), so the
+        // body is the slider alone.
+        return grid;
     }
 
     private void Apply(int watts)
@@ -136,14 +152,14 @@ internal sealed class TdpWidget : WidgetBase
         if (snapshot.SystemPowerKind == SystemPowerKind.Discharging)
             parts.Add($"{snapshot.SystemPower:F1} W system");
         else if (snapshot.SystemPowerKind == SystemPowerKind.Charging)
-            parts.Add($"charging +{snapshot.SystemPower:F1} W");
+            parts.Add($"+{snapshot.SystemPower:F1} W"); // the sign says "charging"
 
         parts.Add($"{snapshot.PackagePower:F1} W APU");
 
         int asked = Hardware.Tdp?.AppliedWatts ?? 0;
         var readback = Hardware.Tdp?.Read();
         if (readback != null && asked > 0 && Math.Abs(readback.StapmLimit - asked) > 1f)
-            parts.Add($"limit overridden to {readback.StapmLimit:F0} W");
+            parts.Add($"overridden to {readback.StapmLimit:F0} W");
 
         _status.Text = string.Join(" · ", parts);
     }

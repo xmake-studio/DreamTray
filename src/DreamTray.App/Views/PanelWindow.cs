@@ -49,6 +49,7 @@ internal sealed class PanelWindow : Window
     private bool _editMode;
 
     // Drag-reorder state.
+    private Grid? _dragSurface;
     private WidgetHost? _dragHost;
     private int _dragFromIndex = -1;
     private Popup? _addPopup;
@@ -202,10 +203,27 @@ internal sealed class PanelWindow : Window
         root.Children.Add(_scroller);
 
         // Drag-reorder is tracked at the window level so the pointer can leave the
-        // grip (and the card) without dropping the gesture.
+        // grip (and the card) without dropping the gesture. The capture has to land
+        // on this same element: captured events are routed to the capture target and
+        // bubble up from there, so capturing an ancestor of the handlers (the frame
+        // below, say) would silently stop the gesture from ever moving.
+        _dragSurface = root;
         root.MouseMove += OnDragMove;
         root.MouseLeftButtonUp += (_, _) => EndDrag();
-        return root;
+
+        // The outline is drawn here rather than as Window.BorderThickness: DWM clips
+        // the window to a rounded rect, which would cut the four corners out of a
+        // square window border. Matching CornerRadius to the DWM radius keeps the
+        // hairline following the same arc the window is clipped to.
+        var frame = new Border
+        {
+            CornerRadius = new CornerRadius(CornerRadius),
+            BorderThickness = new Thickness(1),
+            Background = Brushes.Transparent,
+            Child = root,
+        };
+        frame.SetResourceReference(Border.BorderBrushProperty, "WindowStroke");
+        return frame;
     }
 
     private void RebuildList()
@@ -305,6 +323,10 @@ internal sealed class PanelWindow : Window
                 Content = panel,
             },
         };
+        // Card's own stroke is a dark one, meant for a card sitting on the panel.
+        // A popup floats over the desktop like the panel does, so it takes the
+        // panel's light hairline instead.
+        card.SetResourceReference(Border.BorderBrushProperty, "WindowStroke");
 
         _addPopup = new Popup
         {
@@ -348,7 +370,7 @@ internal sealed class PanelWindow : Window
         _dragHost = host;
         _dragFromIndex = _list.Children.IndexOf(host);
         host.Opacity = 0.6;
-        Mouse.Capture(Content as IInputElement);
+        Mouse.Capture(_dragSurface);
         e.Handled = true;
     }
 

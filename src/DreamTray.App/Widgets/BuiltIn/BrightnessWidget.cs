@@ -93,7 +93,8 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
             value.MinWidth = 38;
 
             var slider = Ui.Slider(0, 100, current, v => OnSliderChanged(display.Id, (int)v));
-            slider.Margin = new Thickness(0, 2, 8, 0);
+            slider.Margin = new Thickness(0, 0, 8, 0);
+            slider.VerticalAlignment = VerticalAlignment.Center;
 
             var grid = new Grid();
             grid.ColumnDefinitions.Add(new ColumnDefinition { Width = new GridLength(1, GridUnitType.Star) });

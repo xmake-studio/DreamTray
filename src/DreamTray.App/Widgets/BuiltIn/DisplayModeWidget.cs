@@ -109,6 +109,9 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
             return;
         }
 
+        // The picker stays in the body rather than on the title row: it is one of
+        // three combos, and hoisting it would leave it out of line with the two it
+        // qualifies.
         var devices = Hardware.GetDisplayDevices();
         if (devices.Count > 1)
         {
