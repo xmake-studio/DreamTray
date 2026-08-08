@@ -1,4 +1,4 @@
-using System.Windows;
+﻿using System.Windows;
 using System.Windows.Controls;
 
 namespace DreamTray.App.Widgets.BuiltIn;
@@ -8,7 +8,7 @@ internal sealed class DisplayModeWidgetFactory : IWidgetFactory
     public const string Id = "core.displaymode";
     public string TypeId => Id;
     public string DisplayName => "Resolution & refresh rate";
-    public string Description => "Change resolution and refresh rate; on a laptop, optionally drop the refresh rate on battery.";
+    public string Description => "Change resolution and refresh rate; on a laptop, optionally drop the mode on battery.";
     public string Glyph => "\uE7F4";
     public IWidget Create(IWidgetContext context) => new DisplayModeWidget(context);
 }
@@ -45,6 +45,39 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
         get => Storage.Get("chargerHz", 0);
         set => Storage.Set("chargerHz", value);
     }
+
+    /// <summary>Stored as "WxH"; empty means "leave the resolution alone".</summary>
+    private (int Width, int Height) BatteryResolution
+    {
+        get => ParseResolution(Storage.Get("batteryRes", ""));
+        set => Storage.Set("batteryRes", FormatResolution(value));
+    }
+
+    private (int Width, int Height) ChargerResolution
+    {
+        get => ParseResolution(Storage.Get("chargerRes", ""));
+        set => Storage.Set("chargerRes", FormatResolution(value));
+    }
+
+    /// <summary>What to do with modes whose aspect ratio is not the panel's own.</summary>
+    private enum OffRatioDisplay { Show, Fade, Hide }
+
+    private OffRatioDisplay OffRatioMode
+    {
+        get => Enum.TryParse(Storage.Get("offRatio", ""), out OffRatioDisplay v) ? v : OffRatioDisplay.Fade;
+        set => Storage.Set("offRatio", value.ToString());
+    }
+
+    private static (int Width, int Height) ParseResolution(string raw)
+    {
+        var parts = raw.Split('x');
+        return parts.Length == 2 && int.TryParse(parts[0], out int w) && int.TryParse(parts[1], out int h)
+            ? (w, h)
+            : (0, 0);
+    }
+
+    private static string FormatResolution((int Width, int Height) r) =>
+        r.Width > 0 && r.Height > 0 ? $"{r.Width}x{r.Height}" : "";
 
     protected override FrameworkElement BuildView()
     {
@@ -103,13 +136,24 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
         var selectedResolution = (current.Width, current.Height);
 
         // Windows lists modes that letterbox or stretch the panel alongside the ones that
-        // fill it. They still work, so they stay selectable — just faded, so the shapes
-        // that match the panel read as the normal choices. The largest mode is the panel's
-        // native one and defines the reference ratio.
+        // fill it. They still work, so by default they stay selectable and are drawn faded,
+        // so the shapes that match the panel read as the normal choices; the setting can
+        // instead treat them as ordinary or drop them from the list. The largest mode is
+        // the panel's native one and defines the reference ratio.
         var native = resolutions[0];
         double nativeRatio = (double)native.Width / native.Height;
         bool OffRatio((int Width, int Height) r) =>
             Math.Abs((double)r.Width / r.Height - nativeRatio) > 0.01;
+
+        var offRatio = OffRatioMode;
+        if (offRatio == OffRatioDisplay.Hide)
+        {
+            // The mode in use stays listed even when off-ratio, or the combo would have
+            // nothing to select and would read as if some other resolution were active.
+            resolutions = resolutions
+                .Where(r => !OffRatio(r) || r == selectedResolution)
+                .ToList();
+        }
 
         var resolutionCombo = Ui.Combo(resolutions, selectedResolution, r =>
         {
@@ -122,7 +166,8 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
                 : modes.Where(m => m.Width == r.Width && m.Height == r.Height)
                        .Max(m => m.RefreshHz);
             ApplyMode(device.DeviceName, new DisplayMode(r.Width, r.Height, hz));
-        }, r => $"{r.Width} × {r.Height}", OffRatio);
+        }, r => $"{r.Width} × {r.Height}",
+           offRatio == OffRatioDisplay.Fade ? OffRatio : null);
 
         var rates = modes
             .Where(m => m.Width == selectedResolution.Width && m.Height == selectedResolution.Height)
@@ -152,7 +197,9 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
     // ---- background rule ----
 
     public override bool WantsBackgroundWork =>
-        Hardware.HasBattery && (BatteryRefreshHz > 0 || ChargerRefreshHz > 0);
+        Hardware.HasBattery &&
+        (BatteryRefreshHz > 0 || ChargerRefreshHz > 0 ||
+         BatteryResolution.Width > 0 || ChargerResolution.Width > 0);
 
     public override void OnBackgroundTick(SystemSnapshot snapshot)
     {
@@ -164,48 +211,99 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
         _lastOnAc = onAc;
         if (first) return;
 
-        int target = onAc ? ChargerRefreshHz : BatteryRefreshHz;
-        if (target <= 0) return;
+        int targetHz = onAc ? ChargerRefreshHz : BatteryRefreshHz;
+        var targetRes = onAc ? ChargerResolution : BatteryResolution;
+        if (targetHz <= 0 && targetRes.Width <= 0) return;
 
         var device = ResolveDevice();
         if (device == null) return;
         var current = Hardware.GetCurrentMode(device.DeviceName);
-        if (current == null || current.RefreshHz == target) return;
+        if (current == null) return;
 
-        Hardware.SetMode(device.DeviceName, current with { RefreshHz = target });
+        int width = targetRes.Width > 0 ? targetRes.Width : current.Width;
+        int height = targetRes.Width > 0 ? targetRes.Height : current.Height;
+        int hz = targetHz > 0 ? targetHz : current.RefreshHz;
+
+        // Resolution and refresh rate are picked independently here, so the pair can name
+        // a mode the display does not have; fall back to the best rate for that size.
+        var modes = Hardware.GetModes(device.DeviceName);
+        if (!modes.Any(m => m.Width == width && m.Height == height && m.RefreshHz == hz))
+        {
+            var forSize = modes.Where(m => m.Width == width && m.Height == height).ToList();
+            if (forSize.Count == 0) return;
+            hz = forSize.Max(m => m.RefreshHz);
+        }
+
+        var target = new DisplayMode(width, height, hz);
+        if (target == current) return;
+        Hardware.SetMode(device.DeviceName, target);
     }
 
     public override FrameworkElement? CreateSettingsView()
     {
-        // The only thing in here is the power-source rule; on a desktop that leaves
-        // an empty flyout, so drop the "…" button instead.
-        if (!Hardware.HasBattery) return null;
-
         var device = ResolveDevice();
-        List<int> rates = device == null
-            ? []
-            : Hardware.GetModes(device.DeviceName)
-                      .Select(m => m.RefreshHz).Distinct()
-                      .OrderByDescending(hz => hz).ToList();
+        var modes = device == null ? [] : Hardware.GetModes(device.DeviceName);
 
-        // 0 means "don't touch it", offered first so the rule is opt-in.
-        var options = new List<int> { 0 };
-        options.AddRange(rates);
+        string RatioLabel(OffRatioDisplay v) => v switch
+        {
+            OffRatioDisplay.Show => "Show",
+            OffRatioDisplay.Hide => "Hide",
+            _ => "Fade",
+        };
 
-        string Label(int hz) => hz == 0 ? "Leave unchanged" : $"{hz} Hz";
+        var ratioSection = new UIElement[]
+        {
+            Ui.Caption("Resolutions that do not match the panel's own aspect ratio letterbox " +
+                       "or stretch the picture. Fading keeps them available but out of the way; " +
+                       "disabling leaves them out of the list entirely."),
+            Ui.LabelRow("Off-ratio modes", Ui.Combo(
+                Enum.GetValues<OffRatioDisplay>(), OffRatioMode, v =>
+                {
+                    OffRatioMode = v;
+                    Rebuild();
+                }, RatioLabel)),
+        };
+
+        // The power-source rule only makes sense on a laptop; on a desktop the flyout is
+        // just the off-ratio choice.
+        if (!Hardware.HasBattery) return Ui.SettingsPanel(ratioSection);
+
+        // 0 / (0, 0) mean "don't touch it", offered first so each rule is opt-in.
+        var rates = new List<int> { 0 };
+        rates.AddRange(modes.Select(m => m.RefreshHz).Distinct().OrderByDescending(hz => hz));
+
+        var sizes = new List<(int Width, int Height)> { (0, 0) };
+        sizes.AddRange(modes.Select(m => (m.Width, m.Height)).Distinct()
+                            .OrderByDescending(r => r.Width * r.Height));
+
+        string HzLabel(int hz) => hz == 0 ? "Leave unchanged" : $"{hz} Hz";
+        string ResLabel((int Width, int Height) r) =>
+            r.Width == 0 ? "Leave unchanged" : $"{r.Width} × {r.Height}";
 
         return Ui.SettingsPanel(
-            Ui.Caption("Automatically switch refresh rate when the charger comes or goes. " +
-                       "Dropping to 60 Hz on battery is usually worth 1–2 W."),
-            Ui.LabelRow("On battery", Ui.Combo(options, BatteryRefreshHz, v =>
-            {
-                BatteryRefreshHz = v;
-                _lastOnAc = null;
-            }, Label)),
-            Ui.LabelRow("On charger", Ui.Combo(options, ChargerRefreshHz, v =>
-            {
-                ChargerRefreshHz = v;
-                _lastOnAc = null;
-            }, Label)));
+            [.. ratioSection,
+             Ui.Separator(),
+             Ui.Caption("Automatically switch the display mode when the charger comes or goes. " +
+                        "Dropping to 60 Hz on battery is usually worth 1–2 W."),
+             Ui.LabelRow("Battery refresh", Ui.Combo(rates, BatteryRefreshHz, v =>
+             {
+                 BatteryRefreshHz = v;
+                 _lastOnAc = null;
+             }, HzLabel)),
+             Ui.LabelRow("Charger refresh", Ui.Combo(rates, ChargerRefreshHz, v =>
+             {
+                 ChargerRefreshHz = v;
+                 _lastOnAc = null;
+             }, HzLabel)),
+             Ui.LabelRow("Battery resolution", Ui.Combo(sizes, BatteryResolution, v =>
+             {
+                 BatteryResolution = v;
+                 _lastOnAc = null;
+             }, ResLabel)),
+             Ui.LabelRow("Charger resolution", Ui.Combo(sizes, ChargerResolution, v =>
+             {
+                 ChargerResolution = v;
+                 _lastOnAc = null;
+             }, ResLabel))]);
     }
 }

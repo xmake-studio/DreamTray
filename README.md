@@ -64,7 +64,7 @@ and wasn't detected.
 | Component power | CPU cores, GPU/SoC, whole package, and — on a laptop — the battery charge/discharge rate. |
 | Load | CPU, GPU, memory. |
 | Sleep | Standby idle timeout and the lid-close action, read and written on the active Windows power plan. Shows the AC or battery half depending on what you are running on, and follows the charger. |
-| Resolution & refresh rate | Per-display mode picker. On a laptop, optionally drop to a chosen refresh rate on battery. |
+| Resolution & refresh rate | Per-display mode picker. On a laptop, optionally switch to a chosen resolution and refresh rate when the charger comes or goes. Modes that do not match the panel's aspect ratio can be shown, faded, or left out. |
 
 Plugins can add widgets of their own; the bundled one is listed under
 [Writing a plugin](#writing-a-plugin).

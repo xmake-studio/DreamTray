@@ -16,7 +16,11 @@ public sealed class DisplayModeService
     /// <summary>Attached, active displays, primary first.</summary>
     public IReadOnlyList<DisplayDevice> GetDevices()
     {
-        var result = new List<DisplayDevice>();
+        var config = DisplayConfigNames.Query();
+
+        // Collect first, name second: "External display" is only numbered once we know
+        // there is more than one of them, which matches how the brightness list reads.
+        var found = new List<(string DeviceName, string Described, bool IsInternal, bool IsPrimary)>();
         var dd = new DISPLAY_DEVICE { cb = Marshal.SizeOf<DISPLAY_DEVICE>() };
         for (uint i = 0; EnumDisplayDevices(null, i, ref dd, 0); i++)
         {
@@ -25,13 +29,38 @@ public sealed class DisplayModeService
             if (!attached) continue;
             bool primary = (dd.StateFlags & DISPLAY_DEVICE_PRIMARY_DEVICE) != 0;
 
-            // The adapter's DeviceString is the GPU name; the monitor's friendly name
-            // lives on the child device, so query one level down.
-            string friendly = GetMonitorName(dd.DeviceName) ?? dd.DeviceString;
-            result.Add(new DisplayDevice(dd.DeviceName, friendly, primary));
+            // The adapter's DeviceString is the GPU name; the monitor's own description
+            // lives on the child device, so query one level down. The CCD name is better
+            // still when it is there, because it comes from the EDID rather than the INF.
+            config.TryGetValue(dd.DeviceName, out var entry);
+            string described = !string.IsNullOrWhiteSpace(entry.FriendlyName)
+                ? entry.FriendlyName
+                : GetMonitorName(dd.DeviceName) ?? dd.DeviceString;
+
+            found.Add((dd.DeviceName, described, entry.IsInternal, primary));
+        }
+
+        int externals = found.Count(d => !d.IsInternal);
+        int externalIndex = 0;
+        var result = new List<DisplayDevice>();
+        foreach (var d in found)
+        {
+            string name = d.IsInternal
+                ? "Built-in display"
+                : Describe(d.Described, externals == 1 ? null : ++externalIndex);
+            result.Add(new DisplayDevice(d.DeviceName, name, d.IsPrimary));
         }
         return result.OrderByDescending(d => d.IsPrimary).ToList();
     }
+
+    /// <summary>
+    /// Same rule as the brightness list, so the two widgets agree: a monitor that
+    /// only reports the driver's placeholder description gets a positional name.
+    /// </summary>
+    private static string Describe(string description, int? index) =>
+        string.IsNullOrWhiteSpace(description) || description == "Generic PnP Monitor"
+            ? (index is null ? "External display" : $"External display {index}")
+            : description;
 
     private static string? GetMonitorName(string adapterName)
     {

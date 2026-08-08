@@ -306,10 +306,23 @@ public sealed class BrightnessService : IDisposable
         public string szPhysicalMonitorDescription;
     }
 
+    [StructLayout(LayoutKind.Sequential, CharSet = CharSet.Unicode)]
+    private struct MONITORINFOEX
+    {
+        public int cbSize;
+        public int left, top, right, bottom;          // monitor rect
+        public int workLeft, workTop, workRight, workBottom;
+        public uint dwFlags;
+        [MarshalAs(UnmanagedType.ByValTStr, SizeConst = 32)] public string szDevice;
+    }
+
     private delegate bool MonitorEnumProc(nint hMonitor, nint hdc, nint rect, nint data);
 
     [DllImport("user32.dll")]
     private static extern bool EnumDisplayMonitors(nint hdc, nint clip, MonitorEnumProc proc, nint data);
+
+    [DllImport("user32.dll", CharSet = CharSet.Unicode, EntryPoint = "GetMonitorInfoW")]
+    private static extern bool GetMonitorInfo(nint hMonitor, ref MONITORINFOEX mi);
 
     [DllImport("dxva2.dll", SetLastError = true)]
     private static extern bool GetNumberOfPhysicalMonitorsFromHMONITOR(nint hMonitor, out uint count);
@@ -329,14 +342,30 @@ public sealed class BrightnessService : IDisposable
     private static List<(nint Handle, string Description)> EnumeratePhysicalMonitors()
     {
         var result = new List<(nint, string)>();
+
+        // dxva2 reports the driver's description, which for most monitors is the
+        // useless "Generic PnP Monitor". The CCD API has the EDID name ("PHL 288E2"),
+        // keyed by GDI device name — which is what GetMonitorInfo gives us for the
+        // HMONITOR we are already walking.
+        var config = DisplayConfigNames.Query();
+
         EnumDisplayMonitors(nint.Zero, nint.Zero, (hMonitor, _, _, _) =>
         {
+            var mi = new MONITORINFOEX { cbSize = Marshal.SizeOf<MONITORINFOEX>() };
+            string friendly = GetMonitorInfo(hMonitor, ref mi) &&
+                              config.TryGetValue(mi.szDevice, out var entry)
+                ? entry.FriendlyName
+                : "";
+
             if (GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor, out uint count) && count > 0)
             {
                 var buf = new PhysicalMonitor[count];
                 if (GetPhysicalMonitorsFromHMONITOR(hMonitor, count, buf))
                     foreach (var pm in buf)
-                        result.Add((pm.hPhysicalMonitor, pm.szPhysicalMonitorDescription));
+                        result.Add((pm.hPhysicalMonitor,
+                                    string.IsNullOrWhiteSpace(friendly)
+                                        ? pm.szPhysicalMonitorDescription
+                                        : friendly));
             }
             return true;
         }, nint.Zero);
