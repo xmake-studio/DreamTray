@@ -26,7 +26,6 @@ internal sealed class TrayController : IDisposable
     public void Start()
     {
         _icon = new TrayIcon("DreamTray", lightIcon: _services.Theme.TrayUsesDark);
-        _icon.Pressed += OnIconPressed;
         _icon.Activated += TogglePanel;
         _icon.ContextMenuRequested += ShowContextMenu;
 
@@ -40,64 +39,47 @@ internal sealed class TrayController : IDisposable
     // ---------------------------------------------------------------- panel
 
     /// <summary>
-    /// Fallback debounce for the hide-then-click sequence described on
-    /// LastHiddenTicks, for activations that arrive without a press of their own
-    /// (the keyboard, or a shell that does not forward the button-down).
+    /// Open if closed, close if open — every time, with nothing debounced or
+    /// swallowed. The panel does not dismiss itself when the tray icon takes focus
+    /// (see DismissedByCaller), so this is the only thing that toggles it and there
+    /// is no second dismissal to disambiguate.
+    ///
+    /// IsClosing, not just IsVisible: a panel playing its exit is on its way out and
+    /// counts as closed, so a click during the animation turns it straight back
+    /// round rather than being absorbed.
     /// </summary>
-    private const int ReopenGuardMs = 300;
-
-    /// <summary>
-    /// The press of this click already dismissed the panel, so its release must not
-    /// reopen it. Tracked per click rather than on a timer: pressing the button takes
-    /// focus from the panel and closes it immediately, but the release can come an
-    /// arbitrarily long time later if the user holds the button down — and a timeout
-    /// long since expired made that one click close and then reopen the panel.
-    /// </summary>
-    private bool _pressDismissed;
-
-    private void OnIconPressed()
-    {
-        // IsClosing, not just IsVisible: during the exit animation the window is
-        // still visible, and HidePanel ignores a second dismissal — so a click there
-        // would be swallowed. A panel on its way out counts as already closed.
-        if (_panel == null) { _pressDismissed = false; return; }
-
-        if (_panel is { IsVisible: true, IsClosing: false })
-        {
-            _panel.HidePanel();
-            _pressDismissed = true;
-            return;
-        }
-        // The panel may already be on its way out: taking focus for the taskbar can
-        // reach the panel's Deactivated before this message is dispatched. That close
-        // still belongs to this press, so the release must not reopen. The window is
-        // only consulted here, at press time — which is when the deactivation happens
-        // — so how long the button is then held makes no difference.
-        _pressDismissed = _panel.IsClosing ||
-                          Environment.TickCount64 - _panel.LastHiddenTicks < ReopenGuardMs;
-    }
-
     private void TogglePanel()
     {
-        if (_pressDismissed)
-        {
-            _pressDismissed = false;
-            return; // this click's press closed the panel; the release is not a reopen
-        }
-        if (_panel is { IsVisible: true, IsClosing: false })
-        {
-            _panel.HidePanel();
-            return;
-        }
-        if (_panel != null && Environment.TickCount64 - _panel.LastHiddenTicks < ReopenGuardMs)
-            return; // the click that closed it; do not bounce straight back open
-        ShowPanel();
+        if (_panel is { IsVisible: true, IsClosing: false }) _panel.HidePanel();
+        else ShowPanel();
     }
+
+    /// <summary>
+    /// True when the panel is losing focus to a left-button press on the tray icon —
+    /// the click this controller is about to toggle on. Both halves matter: the
+    /// pointer alone would also swallow the dismissal when the user merely alt-tabs
+    /// away with the cursor parked over the icon.
+    /// </summary>
+    private bool PointerOverIcon()
+    {
+        if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) return false;
+        var rect = _icon?.GetIconRect() ?? Rect.Empty;
+        return !rect.IsEmpty && rect.Contains(WindowEffects.GetCursorPosition());
+    }
+
+    private const int VK_LBUTTON = 0x01;
+
+    [System.Runtime.InteropServices.DllImport("user32.dll")]
+    private static extern short GetAsyncKeyState(int vKey);
 
     public void ShowPanel()
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
-        _panel ??= new PanelWindow(_services, OpenSettings);
+        if (_panel == null)
+        {
+            _panel = new PanelWindow(_services, OpenSettings);
+            _panel.DismissedByCaller = PointerOverIcon;
+        }
         _panel.ShowNear(_icon?.GetIconRect() ?? Rect.Empty);
         // Everything above runs on the UI thread between the click and the panel
         // being composed, so anything slow in a widget's OnShown shows up here as a
@@ -115,7 +97,8 @@ internal sealed class TrayController : IDisposable
     /// first. That is the one open that is reliably slow. Doing it at idle after
     /// startup moves the cost to a moment when nobody is waiting.
     /// </summary>
-    public void Prewarm() => _panel ??= new PanelWindow(_services, OpenSettings);
+    public void Prewarm() =>
+        _panel ??= new PanelWindow(_services, OpenSettings) { DismissedByCaller = PointerOverIcon };
 
     public void OpenSettings()
     {

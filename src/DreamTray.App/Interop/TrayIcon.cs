@@ -33,17 +33,15 @@ internal sealed class TrayIcon : IDisposable
     private nint _iconHandle;
     private bool _added;
     private bool _light;
-    /// <summary>Set between a DBLCLK and the button release that belongs to it.</summary>
-    private bool _dblClickPending;
+    /// <summary>Set between a press already acted on and the release that ends it.</summary>
+    private bool _pressHandled;
 
-    /// <summary>Left click (or Enter/Space on the keyboard-focused icon).</summary>
-    public event Action? Activated;
     /// <summary>
-    /// The left button went down on the icon. Raised before <see cref="Activated"/>
-    /// for the same click, and it is the press — not the release — that takes focus
-    /// away from an open panel, so this is where a dismissal belongs.
+    /// Left click (or Enter/Space on the keyboard-focused icon). Raised on the button
+    /// going *down*: that is the moment the shell moves focus, and waiting for the
+    /// release only makes the panel answer late on a slow click.
     /// </summary>
-    public event Action? Pressed;
+    public event Action? Activated;
     /// <summary>Right click — the app shows its context menu.</summary>
     public event Action? ContextMenuRequested;
 
@@ -180,31 +178,29 @@ internal sealed class TrayIcon : IDisposable
             int mouseMessage = (int)(lParam & 0xFFFF);
             switch (mouseMessage)
             {
+                case WM_LBUTTONDOWN:
+                    _pressHandled = true;
+                    Activated?.Invoke();
+                    handled = true;
+                    break;
+
                 // Two clicks inside the system double-click time (500 ms by default)
-                // arrive as UP, DBLCLK, UP — the second click's *down* is promoted to
-                // DBLCLK. Handling only UP therefore drops every second click of an
-                // ordinary two-clicks-a-second rhythm, which reads as the panel
-                // ignoring a click. A tray icon has no separate double-click gesture,
-                // so DBLCLK is simply another activation.
+                // arrive as DOWN, UP, DBLCLK, UP — the second click's press is promoted
+                // to DBLCLK. A tray icon has no separate double-click gesture, so this
+                // is simply that click's press; without it every second click of a fast
+                // double click would be dropped.
                 case WM_LBUTTONDBLCLK:
-                    _dblClickPending = true;
-                    Pressed?.Invoke();   // DBLCLK stands in for this click's press
+                    _pressHandled = true;
                     Activated?.Invoke();
                     handled = true;
                     break;
 
                 case WM_LBUTTONUP:
-                    // The UP that closes a DBLCLK pair is that same click's release,
-                    // not a new one. Whether the shell sends it varies; the flag is
-                    // cleared by the next press either way, so neither case misfires.
-                    if (_dblClickPending) _dblClickPending = false;
+                    // The release of a click already acted on at press time. It only
+                    // means anything when no press came with it — the keyboard's
+                    // Enter/Space on the focused icon arrives as a bare UP.
+                    if (_pressHandled) _pressHandled = false;
                     else Activated?.Invoke();
-                    handled = true;
-                    break;
-
-                case WM_LBUTTONDOWN:
-                    _dblClickPending = false;
-                    Pressed?.Invoke();
                     handled = true;
                     break;
                 case WM_RBUTTONUP:

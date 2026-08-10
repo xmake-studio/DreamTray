@@ -132,7 +132,15 @@ internal sealed class PanelWindow : Window
         _manager.Load();
         RebuildList();
 
-        Deactivated += (_, _) => HidePanel();
+        Deactivated += (_, _) =>
+        {
+            // A click on the tray icon deactivates the panel too, but that click is a
+            // toggle and the toggle handles the close itself. Hiding here as well
+            // would make the press close the panel and the toggle immediately reopen
+            // it, so this one deactivation is left alone.
+            if (DismissedByCaller?.Invoke() == true) return;
+            HidePanel();
+        };
         SizeChanged += OnSizeChanged;
         PreviewKeyDown += OnKeyDown;
         SourceInitialized += OnSourceInitialized;
@@ -457,11 +465,10 @@ internal sealed class PanelWindow : Window
     }
 
     /// <summary>
-    /// When the panel was last hidden. Clicking the tray icon while the panel is
-    /// open deactivates it first, so by the time the click arrives the panel is
-    /// already hidden and a naive toggle would reopen it immediately.
+    /// Asked on deactivation whether the click that stole focus is one the owner is
+    /// about to act on itself — a press on the tray icon. True means "leave it to me".
     /// </summary>
-    public long LastHiddenTicks { get; private set; }
+    public Func<bool>? DismissedByCaller { get; set; }
 
     /// <summary>
     /// The panel is on screen but playing its exit. It is on its way out, so a
@@ -475,9 +482,6 @@ internal sealed class PanelWindow : Window
         // true and a second dismissal (a tray click landing on top of the Deactivated
         // that started this one) would restart the animation from full opacity.
         if (!IsVisible || _closing) return;
-        // Stamped when the dismissal starts rather than when the window actually
-        // disappears, so the reopen guard covers the exit animation too.
-        LastHiddenTicks = Environment.TickCount64;
         foreach (var host in _list.Children.OfType<WidgetHost>()) host.CloseSettings();
         if (_addPopup != null) _addPopup.IsOpen = false;
 
