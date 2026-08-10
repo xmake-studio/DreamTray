@@ -20,7 +20,9 @@ internal sealed class TrayIcon : IDisposable
 {
     private const int WM_APP = 0x8000;
     private const int WM_TRAYCALLBACK = WM_APP + 1;
+    private const int WM_LBUTTONDOWN = 0x0201;
     private const int WM_LBUTTONUP = 0x0202;
+    private const int WM_LBUTTONDBLCLK = 0x0203;
     private const int WM_RBUTTONUP = 0x0205;
     private const int WM_DPICHANGED = 0x02E0;
 
@@ -31,9 +33,17 @@ internal sealed class TrayIcon : IDisposable
     private nint _iconHandle;
     private bool _added;
     private bool _light;
+    /// <summary>Set between a DBLCLK and the button release that belongs to it.</summary>
+    private bool _dblClickPending;
 
     /// <summary>Left click (or Enter/Space on the keyboard-focused icon).</summary>
     public event Action? Activated;
+    /// <summary>
+    /// The left button went down on the icon. Raised before <see cref="Activated"/>
+    /// for the same click, and it is the press — not the release — that takes focus
+    /// away from an open panel, so this is where a dismissal belongs.
+    /// </summary>
+    public event Action? Pressed;
     /// <summary>Right click — the app shows its context menu.</summary>
     public event Action? ContextMenuRequested;
 
@@ -170,8 +180,31 @@ internal sealed class TrayIcon : IDisposable
             int mouseMessage = (int)(lParam & 0xFFFF);
             switch (mouseMessage)
             {
-                case WM_LBUTTONUP:
+                // Two clicks inside the system double-click time (500 ms by default)
+                // arrive as UP, DBLCLK, UP — the second click's *down* is promoted to
+                // DBLCLK. Handling only UP therefore drops every second click of an
+                // ordinary two-clicks-a-second rhythm, which reads as the panel
+                // ignoring a click. A tray icon has no separate double-click gesture,
+                // so DBLCLK is simply another activation.
+                case WM_LBUTTONDBLCLK:
+                    _dblClickPending = true;
+                    Pressed?.Invoke();   // DBLCLK stands in for this click's press
                     Activated?.Invoke();
+                    handled = true;
+                    break;
+
+                case WM_LBUTTONUP:
+                    // The UP that closes a DBLCLK pair is that same click's release,
+                    // not a new one. Whether the shell sends it varies; the flag is
+                    // cleared by the next press either way, so neither case misfires.
+                    if (_dblClickPending) _dblClickPending = false;
+                    else Activated?.Invoke();
+                    handled = true;
+                    break;
+
+                case WM_LBUTTONDOWN:
+                    _dblClickPending = false;
+                    Pressed?.Invoke();
                     handled = true;
                     break;
                 case WM_RBUTTONUP:

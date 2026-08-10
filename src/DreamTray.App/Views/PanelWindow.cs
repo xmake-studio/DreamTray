@@ -463,6 +463,12 @@ internal sealed class PanelWindow : Window
     /// </summary>
     public long LastHiddenTicks { get; private set; }
 
+    /// <summary>
+    /// The panel is on screen but playing its exit. It is on its way out, so a
+    /// toggle must treat it as closed and reopen it rather than dismiss it again.
+    /// </summary>
+    public bool IsClosing => _closing;
+
     public void HidePanel()
     {
         // _closing: the panel is still on screen playing its exit, so IsVisible is

@@ -41,6 +41,9 @@ public sealed class AppServices : IDisposable
         };
         Sensors = new SensorSampler(dispatcher, Log.Write);
         Brightness = new BrightnessService(Log.Write);
+        // Scan displays now, in the background, so the first panel open finds a list
+        // waiting rather than paying for a WMI query and a DDC round trip per monitor.
+        Brightness.WarmUp();
         DisplayModes = new DisplayModeService(Log.Write);
         Tdp = new TdpService(Log.Write);
         PowerPolicy = new PowerPolicyService(Log.Write);

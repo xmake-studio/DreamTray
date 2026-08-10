@@ -21,9 +21,23 @@ namespace DreamTray.Display;
 public sealed class BrightnessService : IDisposable
 {
     private readonly Action<string> _log;
+    /// <summary>Guards <see cref="_pending"/> only — never held across a hardware call.</summary>
     private readonly object _gate = new();
+    /// <summary>Serialises enumeration so two scans cannot open handles at once.</summary>
+    private readonly object _enumGate = new();
+    /// <summary>
+    /// Held while native handles are used or destroyed, so a re-scan cannot free a
+    /// handle out from under the write worker. Only background threads ever take it.
+    /// </summary>
+    private readonly object _ddcGate = new();
 
-    private List<Target> _targets = [];
+    /// <summary>
+    /// The published display list. Replaced wholesale, never mutated, so readers —
+    /// the UI thread among them — can take it without a lock. This is the whole
+    /// reason the panel opens on time: a scan that is stuck waiting on a sleeping
+    /// monitor must not be able to block the click that opens the panel.
+    /// </summary>
+    private volatile List<Target> _targets = [];
     private readonly Dictionary<string, int> _pending = [];
     private readonly AutoResetEvent _wake = new(false);
     private Thread? _worker;
@@ -47,14 +61,23 @@ public sealed class BrightnessService : IDisposable
 
     // ---------------------------------------------------------------- enumeration
 
+    /// <summary>
+    /// The displays known right now. Without <paramref name="refresh"/> this never
+    /// touches hardware and never blocks, so it is safe on the UI thread; the first
+    /// scan is kicked off in the background by <see cref="WarmUp"/> at startup.
+    /// </summary>
     public IReadOnlyList<DisplayTarget> GetDisplays(bool refresh = false)
     {
-        lock (_gate)
-        {
-            if (refresh || _targets.Count == 0) Enumerate();
-            return _targets.Select(t => t.Public).ToList();
-        }
+        if (refresh) Enumerate();
+        else if (!_scanned) RefreshAsync(); // nothing known yet; get a scan moving
+        return _targets.Select(t => t.Public).ToList();
     }
+
+    /// <summary>True once a scan has completed, so callers know the list is real.</summary>
+    private volatile bool _scanned;
+
+    /// <summary>Start the first scan at app start, off the UI thread.</summary>
+    public void WarmUp() => RefreshAsync();
 
     /// <summary>
     /// Re-enumerate off the calling thread and call <paramref name="onCompleted"/>
@@ -87,23 +110,27 @@ public sealed class BrightnessService : IDisposable
     /// <summary>Re-read the current brightness of every display (a few ms each).</summary>
     public void RefreshValues()
     {
-        Target[] targets;
-        lock (_gate) targets = _targets.ToArray();
-
-        foreach (var t in targets)
+        lock (_ddcGate)
         {
-            int v = t.WmiMethods != null ? ReadWmiBrightness() : ReadDdcBrightness(t);
-            if (v >= 0) t.Public.Brightness = v;
+            foreach (var t in _targets)
+            {
+                int v = t.WmiMethods != null ? ReadWmiBrightness() : ReadDdcBrightness(t);
+                if (v >= 0) t.Public.Brightness = v;
+            }
         }
     }
 
     private void Enumerate()
     {
-        foreach (var t in _targets)
-        {
-            if (t.DdcHandle != 0) DestroyPhysicalMonitor(t.DdcHandle);
-            t.WmiMethods?.Dispose();
-        }
+        lock (_enumGate) EnumerateCore();
+    }
+
+    private void EnumerateCore()
+    {
+        // The previous targets stay live and published until the new list is ready:
+        // a scan can take seconds, and readers asking meanwhile should get the last
+        // known displays rather than an empty panel.
+        var previous = _targets;
 
         var list = new List<Target>();
 
@@ -160,7 +187,19 @@ public sealed class BrightnessService : IDisposable
             });
         }
 
-        _targets = list;
+        // Publish, then release what the old list owned — under _ddcGate so the write
+        // worker cannot be part-way through a call on a handle being destroyed.
+        lock (_ddcGate)
+        {
+            _targets = list;
+            _scanned = true;
+            foreach (var t in previous)
+            {
+                if (t.DdcHandle != 0) DestroyPhysicalMonitor(t.DdcHandle);
+                t.WmiMethods?.Dispose();
+            }
+        }
+
         _log($"brightness: {list.Count} controllable display(s): " +
              string.Join(", ", list.Select(t => $"{t.Public.Id}={t.Public.Name}")));
     }
@@ -179,11 +218,11 @@ public sealed class BrightnessService : IDisposable
     public bool SetBrightness(string displayId, int percent)
     {
         percent = Math.Clamp(percent, 0, 100);
+        var t = _targets.FirstOrDefault(x => x.Public.Id == displayId);
+        if (t == null) return false;
+        t.Public.Brightness = percent; // optimistic: the UI reflects it immediately
         lock (_gate)
         {
-            var t = _targets.FirstOrDefault(x => x.Public.Id == displayId);
-            if (t == null) return false;
-            t.Public.Brightness = percent; // optimistic: the UI reflects it immediately
             _pending[displayId] = percent;
             EnsureWorker();
         }
@@ -193,14 +232,15 @@ public sealed class BrightnessService : IDisposable
 
     public void SetAll(int percent)
     {
+        var targets = _targets;
         lock (_gate)
         {
-            foreach (var t in _targets)
+            foreach (var t in targets)
             {
                 t.Public.Brightness = Math.Clamp(percent, 0, 100);
                 _pending[t.Public.Id] = t.Public.Brightness;
             }
-            if (_targets.Count > 0) EnsureWorker();
+            if (targets.Count > 0) EnsureWorker();
         }
         _wake.Set();
     }
@@ -231,16 +271,20 @@ public sealed class BrightnessService : IDisposable
 
             foreach (var (id, value) in batch)
             {
-                Target? t;
-                lock (_gate) t = _targets.FirstOrDefault(x => x.Public.Id == id);
-                if (t == null) continue;
-
-                try
+                // Under _ddcGate for the whole write: a re-scan that lands mid-batch
+                // frees the handles this loop is holding.
+                lock (_ddcGate)
                 {
-                    if (t.WmiMethods != null) WriteWmiBrightness(t.WmiMethods, value);
-                    else WriteDdcBrightness(t, value);
+                    var t = _targets.FirstOrDefault(x => x.Public.Id == id);
+                    if (t == null) continue;
+
+                    try
+                    {
+                        if (t.WmiMethods != null) WriteWmiBrightness(t.WmiMethods, value);
+                        else WriteDdcBrightness(t, value);
+                    }
+                    catch (Exception ex) { _log($"brightness write to {id} failed: {ex.Message}"); }
                 }
-                catch (Exception ex) { _log($"brightness write to {id} failed: {ex.Message}"); }
             }
 
             // Monitors dislike back-to-back DDC writes; this also coalesces a drag
@@ -397,14 +441,14 @@ public sealed class BrightnessService : IDisposable
         _stop = true;
         _wake.Set();
         _worker?.Join(1000);
-        lock (_gate)
+        lock (_ddcGate)
         {
             foreach (var t in _targets)
             {
                 if (t.DdcHandle != 0) DestroyPhysicalMonitor(t.DdcHandle);
                 t.WmiMethods?.Dispose();
             }
-            _targets.Clear();
+            _targets = [];
         }
         _wake.Dispose();
     }
