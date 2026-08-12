@@ -42,6 +42,23 @@ internal static class ThemeManager
             ? Rgba(0x1A, 0x1A, 0x1A, translucent ? (byte)0xF2 : (byte)0xFF)
             : Rgba(0xEE, 0xEE, 0xEE, translucent ? (byte)0xF2 : (byte)0xFF));
 
+        // The tint the panel lays over its backdrop.
+        //
+        // A DWM backdrop on its own is not what a Windows flyout looks like: the
+        // material is only the blur, and the shell puts a heavy tint on top of it.
+        // WinUI's own acrylic recipe is a tint colour at ~15% plus a *luminosity*
+        // layer at ~96%, which together let barely any wallpaper through — enough to
+        // pick up its colour, nowhere near enough to read the desktop through the
+        // panel. Without that layer the wallpaper's own brightness comes through
+        // undimmed, which on a light desktop washes the whole panel out.
+        //
+        // This is a separate token from WindowBackground because that one is a
+        // *fill* — the slider thumb and the toggle knob are painted with it, and
+        // they have to stay opaque whatever the panel is doing behind them.
+        Set(resources, "PanelBackground", translucent
+            ? (dark ? Rgba(0x1C, 0x1C, 0x1C, 0xD9) : Rgba(0xF3, 0xF3, 0xF3, 0xD9))
+            : (dark ? Rgba(0x1A, 0x1A, 0x1A, 0xFF) : Rgba(0xEE, 0xEE, 0xEE, 0xFF)));
+
         // The hairline around the panel itself. Unlike the cards this one *is* a
         // light stroke on dark: the panel floats over the desktop rather than over
         // another surface, so it needs the edge to separate it from whatever is behind.
@@ -52,12 +69,25 @@ internal static class ThemeManager
         // Card — every widget sits on one of these. Clearly lighter than the window
         // in dark mode and clearly closer to white in light mode, which is what
         // gives the Settings app its sense of depth.
-        Set(resources, "CardBackground", dark
-            ? Rgba(0x26, 0x26, 0x26, 0xFF)
-            : Rgba(0xFB, 0xFB, 0xFB, 0xFF));
-        Set(resources, "CardBackgroundHover", dark
-            ? Rgba(0x2C, 0x2C, 0x2C, 0xFF)
-            : Rgba(0xFF, 0xFF, 0xFF, 0xFF));
+        //
+        // The alpha is what decides whether the window reads as translucent at all.
+        // Cards cover almost the entire panel, so an opaque card is an opaque panel
+        // no matter how good the acrylic behind it is — the material would only ever
+        // show in the gutters. WinUI's own card token is a *translucent overlay* for
+        // exactly this reason (CardBackgroundFillColorDefault: 5% white on dark, 70%
+        // white on light), and layering that over acrylic is what gives a Windows
+        // flyout its depth: the desktop stays faintly visible through the whole
+        // surface, tinted once by the material and again by the card.
+        //
+        // Without a backdrop there is nothing behind the panel but its own solid
+        // fill, so translucent cards there would only mean muddier contrast. Those
+        // stay opaque.
+        Set(resources, "CardBackground", translucent
+            ? (dark ? Rgba(0xFF, 0xFF, 0xFF, 0x0D) : Rgba(0xFF, 0xFF, 0xFF, 0xB3))
+            : (dark ? Rgba(0x26, 0x26, 0x26, 0xFF) : Rgba(0xFB, 0xFB, 0xFB, 0xFF)));
+        Set(resources, "CardBackgroundHover", translucent
+            ? (dark ? Rgba(0xFF, 0xFF, 0xFF, 0x17) : Rgba(0xFF, 0xFF, 0xFF, 0xCC))
+            : (dark ? Rgba(0x2C, 0x2C, 0x2C, 0xFF) : Rgba(0xFF, 0xFF, 0xFF, 0xFF)));
         // WinUI draws card edges with a dark stroke in both themes; a white stroke
         // on dark haloes the card and reads as grey haze rather than an edge.
         Set(resources, "CardStroke", dark

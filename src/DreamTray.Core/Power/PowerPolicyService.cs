@@ -52,11 +52,27 @@ public sealed class PowerPolicyService(Action<string> log) : IPowerPolicy
         Write(GuidButtonSubgroup, GuidLidCloseAction, onAc, (uint)action);
 
     /// <summary>
-    /// True when this machine has a lid at all. There is no direct query, so we use
-    /// the presence of a readable lid-close setting as the proxy — desktops leave
-    /// the setting unpopulated in the scheme.
+    /// True when this machine actually has a lid. Asks the power manager directly
+    /// (<c>GetPwrCapabilities</c>), because the lid-close setting is present in the
+    /// scheme on desktops too — reading it is not a usable proxy. The query is live,
+    /// so the same build reports true again on a laptop.
     /// </summary>
-    public bool HasLid => Read(GuidButtonSubgroup, GuidLidCloseAction, true) != null;
+    public bool HasLid
+    {
+        get
+        {
+            // SYSTEM_POWER_CAPABILITIES is a long struct we only need one byte of, so
+            // we hand the API a buffer that is comfortably larger than it will ever be
+            // and read the LidPresent flag at its fixed offset (third BOOLEAN).
+            var buffer = new byte[256];
+            if (!GetPwrCapabilities(buffer))
+            {
+                log("power policy: GetPwrCapabilities failed; assuming no lid");
+                return false;
+            }
+            return buffer[2] != 0;
+        }
+    }
 
     // ---------------------------------------------------------------- internals
 
@@ -158,6 +174,10 @@ public sealed class PowerPolicyService(Action<string> log) : IPowerPolicy
     [DllImport("powrprof.dll")]
     private static extern uint PowerWriteDCValueIndex(nint rootPowerKey, ref Guid schemeGuid,
         ref Guid subGroupGuid, ref Guid settingGuid, uint value);
+
+    [DllImport("powrprof.dll")]
+    [return: MarshalAs(UnmanagedType.Bool)]
+    private static extern bool GetPwrCapabilities([Out] byte[] systemPowerCapabilities);
 
     [DllImport("kernel32.dll")]
     private static extern nint LocalFree(nint mem);

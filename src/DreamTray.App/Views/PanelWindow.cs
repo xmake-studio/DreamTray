@@ -22,6 +22,10 @@ internal sealed class PanelWindow : Window
     private const double PanelWidth = 340;
     private const double EdgeMargin = 12;
     private const double CornerRadius = 16;
+    // What DWM's own DWMWCP_ROUND arc measures, in dips. The translucent path leans on
+    // that rounding instead of a region (see ApplyWindowEffects), and the hairline
+    // border has to follow the same arc the window is actually clipped to.
+    private const double DwmCornerRadius = 8;
 
     // Windows 11's tray flyouts do not fade. They start entirely outside the monitor,
     // travel the whole way in — past the taskbar, which draws over them — and stop at
@@ -65,6 +69,14 @@ internal sealed class PanelWindow : Window
     private int _regionWidth = -1;
     private int _regionHeight = -1;
 
+    // The outline that traces the window's corners; its radius has to match whichever
+    // rounding is in force. Set once by BuildLayout.
+    private Border? _frame;
+
+    // Whether the corners are currently DWM's rather than ours. True while a backdrop
+    // material is live — a region would clip it with hard edges.
+    private bool _dwmCorners;
+
     // The two ends of the slide. _rest* is where the panel belongs once it has
     // settled, _offscreenTop* is the far end just past the monitor edge. Kept in
     // device pixels because that is what the per-frame move takes, and in DIPs
@@ -85,6 +97,9 @@ internal sealed class PanelWindow : Window
     private IEasingFunction _slideEase = OpenEase;
     private Action? _slideDone;
     private bool _slideRunning;
+    // Last vertical position handed to the window manager, so a frame that resolves
+    // to the same pixel does not pay for a recomposite. See OnSlideFrame.
+    private int _lastMovedToPx = int.MinValue;
 
     // Pending "compose at rest, then jump off-screen and slide in" step. See BeginReveal.
     private EventHandler? _reveal;
@@ -227,15 +242,15 @@ internal sealed class PanelWindow : Window
         // the window to a rounded rect, which would cut the four corners out of a
         // square window border. Matching CornerRadius to the DWM radius keeps the
         // hairline following the same arc the window is clipped to.
-        var frame = new Border
+        _frame = new Border
         {
             CornerRadius = new CornerRadius(CornerRadius),
             BorderThickness = new Thickness(1),
             Background = Brushes.Transparent,
             Child = root,
         };
-        frame.SetResourceReference(Border.BorderBrushProperty, "WindowStroke");
-        return frame;
+        _frame.SetResourceReference(Border.BorderBrushProperty, "WindowStroke");
+        return _frame;
     }
 
     private void RebuildList()
@@ -488,11 +503,23 @@ internal sealed class PanelWindow : Window
         ApplyPosition();
         Activate();
         Mark("activate");
-        // Every widget's OnShown runs from here. Anything that reads the hardware
-        // rather than its own cache lands in this number.
-        _manager.SetPanelVisible(true);
-        Mark("widgets");
-        if (animate) BeginReveal();
+        // Every widget's OnShown runs from here, and with it every sensor
+        // subscription. The slow hardware reads are already off the UI thread, but
+        // their *results* are not: each one comes back to rebuild its card, which
+        // with SizeToContent resizes the window — and a resize lands in the middle
+        // of the slide, where it fights the per-frame move and rebuilds the corner
+        // region. That is the stutter. Waiting until the panel has arrived costs
+        // nothing visually, because every widget already draws its cached reading
+        // when its card is built.
+        if (animate)
+        {
+            BeginReveal();
+        }
+        else
+        {
+            _manager.SetPanelVisible(true);
+            Mark("widgets");
+        }
         LastOpenTrace = trace.ToString();
     }
 
@@ -575,6 +602,9 @@ internal sealed class PanelWindow : Window
             // Not _restTopPx as captured at the start: the panel may have been
             // re-anchored (a widget added) while the slide was running.
             SettleAt();
+            // Deferred from ShowNear so the sensor traffic it starts cannot resize
+            // the window mid-flight.
+            _manager.SetPanelVisible(true);
         });
     }
 
@@ -622,7 +652,16 @@ internal sealed class PanelWindow : Window
         _slideDone = done;
         _slideRunning = true;
 
-        WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(fromPx));
+        // SizeToContent makes WPF re-measure the window against its content whenever
+        // the window's own rectangle changes — and the slide changes it on every
+        // frame. That is a layout pass per frame over the whole widget tree, on the
+        // UI thread, competing with the move it is triggered by. The height is
+        // already settled by the time a slide starts, so it is pinned for the trip
+        // and handed back at the end.
+        SizeToContent = SizeToContent.Manual;
+
+        _lastMovedToPx = (int)Math.Round(fromPx);
+        WindowEffects.MoveTo(this, _leftPx, _lastMovedToPx);
         _slideClock.Restart();
         CompositionTarget.Rendering += OnSlideFrame;
     }
@@ -635,7 +674,16 @@ internal sealed class PanelWindow : Window
         if (finished) t = 1;
 
         double y = _slideFromPx + (_slideToPx - _slideFromPx) * _slideEase.Ease(t);
-        WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(y));
+        int yPx = (int)Math.Round(y);
+        // A move to where the window already is still makes DWM recompose it, and
+        // with an acrylic backdrop that means re-blurring everything behind it. On a
+        // high-refresh monitor the ease-out's final frames land on the same pixel
+        // several times over, so skipping those is free smoothness.
+        if (yPx != _lastMovedToPx)
+        {
+            _lastMovedToPx = yPx;
+            WindowEffects.MoveTo(this, _leftPx, yPx);
+        }
 
         if (!finished) return;
         // Read the callback before stopping: StopSlide clears it, and it is what
@@ -651,7 +699,11 @@ internal sealed class PanelWindow : Window
     /// </summary>
     private void StopSlide()
     {
-        if (_slideRunning) CompositionTarget.Rendering -= OnSlideFrame;
+        if (_slideRunning)
+        {
+            CompositionTarget.Rendering -= OnSlideFrame;
+            SizeToContent = SizeToContent.Height;
+        }
         _slideRunning = false;
         _slideClock.Reset();
         _slideDone = null;
@@ -727,6 +779,9 @@ internal sealed class PanelWindow : Window
     /// </summary>
     private void UpdateCornerRadius()
     {
+        // With a backdrop live the corners belong to DWM, which rounds the window
+        // itself at any size — there is no region to keep in step.
+        if (_dwmCorners) return;
         if (!WindowEffects.TryGetSize(this, out int width, out int height)) return;
         if (width == _regionWidth && height == _regionHeight) return;
         _regionWidth = width;
@@ -836,32 +891,81 @@ internal sealed class PanelWindow : Window
         _appliedAppearance = (dark, translucent);
 
         WindowEffects.SetDarkMode(this, dark);
-        // SetCornerRadius also turns DWM's own rounding off, and the backdrop change
-        // above can put it back, so force the region to be rebuilt rather than
-        // trusting the cached size. Ordinary resizes are covered by the
-        // WM_WINDOWPOSCHANGED path, which self-heals.
-        _regionWidth = _regionHeight = -1;
-        UpdateCornerRadius();
 
-        (Application.Current as App)?.ApplyTheme(translucent);
-
+        // How the corners get rounded depends on the backdrop, because the two
+        // mechanisms fail in opposite conditions.
+        //
+        // A window region is a hard stencil: it clips in device pixels with no
+        // anti-aliasing, and it cuts through the acrylic the compositor draws behind
+        // the window. On a machine with transparency effects on that reads as chipped,
+        // half-blurred corners on an otherwise rounded panel. DWM's own rounding is
+        // applied by the compositor together with the material, so it stays clean —
+        // it just cannot be given a radius, which is why it is not used everywhere.
+        //
+        // With no backdrop there is nothing for a region to spoil, and the larger
+        // 16-dip radius is the look this panel wants, so the region stays.
+        _dwmCorners = translucent;
         if (translucent)
         {
-            WindowEffects.ExtendFrameIntoClientArea(this);
-            Background = Brushes.Transparent;
+            WindowEffects.ClearCornerRegion(this);
+            _regionWidth = _regionHeight = -1;
         }
         else
         {
-            Background = Application.Current?.TryFindResource("WindowBackground") as Brush
-                         ?? Brushes.White;
+            // The backdrop change above can restore DWM's rounding, so force the
+            // region to be rebuilt rather than trusting the cached size. Ordinary
+            // resizes are covered by the WM_WINDOWPOSCHANGED path, which self-heals.
+            _regionWidth = _regionHeight = -1;
+            UpdateCornerRadius();
         }
+
+        if (_frame is not null)
+            _frame.CornerRadius = new CornerRadius(translucent ? DwmCornerRadius : CornerRadius);
+
+        (Application.Current as App)?.ApplyTheme(translucent);
+
+        if (translucent) WindowEffects.ExtendFrameIntoClientArea(this);
+        // Not Transparent even with a backdrop live: the panel's own tint is what
+        // turns raw blurred wallpaper into a Windows flyout surface. See
+        // PanelBackground in ThemeManager.
+        Background = Application.Current?.TryFindResource("PanelBackground") as Brush
+                     ?? Brushes.White;
+        SetCompositionBackground(translucent);
+    }
+
+    /// <summary>
+    /// Let the DWM material actually reach the screen.
+    ///
+    /// A transparent <see cref="Window.Background"/> is not enough on its own, and
+    /// on its own is worse than nothing: WPF composes the window onto its own
+    /// render surface, and that surface has an opaque background colour of its own —
+    /// black by default. Painting nothing over black leaves black, which is exactly
+    /// the flat panel the acrylic was supposed to be showing through. The backdrop
+    /// was live the whole time, sitting behind a surface that never let it out.
+    ///
+    /// Clearing the composition background is what punches the hole through to it,
+    /// and it is the piece that pairs with DwmExtendFrameIntoClientArea — the frame
+    /// says "glass reaches this far", this says "and nothing of mine covers it".
+    /// </summary>
+    private void SetCompositionBackground(bool translucent)
+    {
+        if (PresentationSource.FromVisual(this) is not System.Windows.Interop.HwndSource source)
+            return;
+        if (source.CompositionTarget is not { } target) return;
+        // Opaque again when there is no material: an unpainted pixel would show the
+        // desktop straight through rather than the window's own colour.
+        target.BackgroundColor = translucent ? Colors.Transparent : Colors.Black;
     }
 
     private void OnThemeChanged()
     {
         WindowEffects.SetDarkMode(this, _services.Theme.IsDark);
-        if (Background is SolidColorBrush { Color.A: 255 })
-            Background = Application.Current?.TryFindResource("WindowBackground") as Brush;
+        // The tokens are frozen brushes, so a theme switch replaces them rather than
+        // recolouring them — the reference held here is the old palette's and has to
+        // be re-read. (Background is a plain property, not a resource reference: it
+        // is chosen by backdrop as well as by theme.)
+        Background = Application.Current?.TryFindResource("PanelBackground") as Brush
+                     ?? Background;
     }
 
     protected override void OnClosed(EventArgs e)

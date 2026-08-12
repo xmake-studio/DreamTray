@@ -89,6 +89,23 @@ internal static class WindowEffects
     }
 
     /// <summary>
+    /// Drop any region set by <see cref="SetCornerRadius"/> and hand the corners back
+    /// to DWM. A region is a 1-bit stencil in device pixels: it clips with hard,
+    /// aliased edges and cuts straight through a backdrop material, which is exactly
+    /// what makes an acrylic window look like it has chipped corners. DWM's own
+    /// rounding is composited with the material and stays smooth, so a translucent
+    /// window wants that instead.
+    /// </summary>
+    public static void ClearCornerRegion(Window window, bool small = false)
+    {
+        nint hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == nint.Zero) return;
+        SetWindowRgn(hwnd, nint.Zero, true);
+        int value = small ? DWMWCP_ROUNDSMALL : DWMWCP_ROUND;
+        DwmSetWindowAttribute(hwnd, DWMWA_WINDOW_CORNER_PREFERENCE, ref value, sizeof(int));
+    }
+
+    /// <summary>
     /// Request a system backdrop. Returns true only when DWM accepted it — the
     /// caller uses that to decide between a translucent tint and a solid fill.
     ///
