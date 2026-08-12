@@ -200,9 +200,19 @@ public sealed class BrightnessService : IDisposable
             }
         }
 
-        _log($"brightness: {list.Count} controllable display(s): " +
-             string.Join(", ", list.Select(t => $"{t.Public.Id}={t.Public.Name}")));
+        // Re-scans are frequent (every display-settings event, every panel open) and
+        // almost always find the same displays; only say something when it changed.
+        var summary = $"brightness: {list.Count} controllable display(s): " +
+                      string.Join(", ", list.Select(t => $"{t.Public.Id}={t.Public.Name}"));
+        if (summary != _lastSummary)
+        {
+            _lastSummary = summary;
+            _log(summary);
+        }
     }
+
+    /// <summary>Last logged display summary; only written from <see cref="EnumerateCore"/>, which _enumGate serialises.</summary>
+    private string? _lastSummary;
 
     private static string Describe(string description, int? index) =>
         string.IsNullOrWhiteSpace(description) || description == "Generic PnP Monitor"
@@ -302,6 +312,8 @@ public sealed class BrightnessService : IDisposable
     /// getting that subtly wrong yields a "not found" at invoke time instead of an
     /// error you can see coming.
     /// </summary>
+    private string? _lastWmiError;
+
     private ManagementObject? FindWmiPanel()
     {
         try
@@ -311,7 +323,16 @@ public sealed class BrightnessService : IDisposable
             foreach (var mo in searcher.Get())
                 return (ManagementObject)mo; // caller owns it; disposed on re-enumerate
         }
-        catch (Exception ex) { _log($"no WMI backlight interface: {ex.Message}"); }
+        catch (Exception ex)
+        {
+            // A desktop has no backlight interface at all, so this throws the same
+            // "not supported" on every single scan. Worth saying once, not forever.
+            if (_lastWmiError != ex.Message)
+            {
+                _lastWmiError = ex.Message;
+                _log($"no WMI backlight interface: {ex.Message}");
+            }
+        }
         return null;
     }
 

@@ -50,6 +50,8 @@ public sealed class AppServices : IDisposable
         DisplayModes.WarmUp();
         // Docks, hotplugs and mode changes made outside DreamTray all land here; both
         // scans are re-run off this thread so the panel never opens onto a stale list.
+        _displayChangeDebounce = new System.Threading.Timer(
+            _ => RescanDisplays(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         Tdp = new TdpService(Log.Write);
         PowerPolicy = new PowerPolicyService(Log.Write);
@@ -129,7 +131,18 @@ public sealed class AppServices : IDisposable
     /// <summary>A host view scoped to one plugin or widget's settings bag.</summary>
     public IPluginHost CreateHost(IStorage storage) => new Host(this, storage);
 
-    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    /// <summary>
+    /// Coalesces a burst of display-settings events into one scan. Windows raises
+    /// several for a single change (and a docking or wake sequence produces a stream
+    /// of them), and each scan costs a WMI query plus a DDC round trip per monitor.
+    /// </summary>
+    private readonly System.Threading.Timer _displayChangeDebounce;
+    private static readonly TimeSpan DisplayChangeDelay = TimeSpan.FromMilliseconds(750);
+
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e) =>
+        _displayChangeDebounce.Change(DisplayChangeDelay, Timeout.InfiniteTimeSpan);
+
+    private void RescanDisplays()
     {
         DisplayModes.RefreshAsync();
         Brightness.RefreshAsync();
@@ -138,6 +151,7 @@ public sealed class AppServices : IDisposable
     public void Dispose()
     {
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
+        _displayChangeDebounce.Dispose();
         Plugins.Dispose();
         Sensors.Dispose();
         Brightness.Dispose();

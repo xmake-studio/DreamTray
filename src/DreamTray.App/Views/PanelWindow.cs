@@ -474,6 +474,11 @@ internal sealed class PanelWindow : Window
         // Cancel a close that is still playing, otherwise its Completed handler
         // would hide the panel we are in the middle of reopening.
         StopAnimations();
+        // Cloaking needs an HWND, and on the very first open there is none yet —
+        // the window is constructed at startup but only gets a handle when it is
+        // shown. Without this the first open of the session is the one that shows
+        // its own assembly, which is exactly the case that is slowest.
+        new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
         // Cloak before showing, and lay the panel out at its *resting* position: a
         // window only ever paints the part of itself that is on screen, so one that
         // is shown off-screen and then slid in arrives with everything below the
@@ -481,10 +486,17 @@ internal sealed class PanelWindow : Window
         // frame where it belongs without the user seeing it happen; BeginReveal jumps
         // it off-screen and starts the slide once that frame exists.
         //
-        // With animation off none of that applies: the panel is shown where it belongs
-        // and stays there, which is also the only path that never needs the cloak.
+        // With animation off there is no slide, but the cloak still earns its keep:
+        // everything below — the backdrop probe, two layout passes, Activate, and the
+        // widgets' own OnShown — runs on the UI thread *after* the window is on
+        // screen, and WPF cannot present a frame until it is done. An uncloaked
+        // Show() therefore puts an empty window up immediately and leaves it there,
+        // showing bare DWM acrylic with none of the panel's tint or content, until
+        // the UI thread finally goes idle. That gap is the delay before the widgets
+        // appear. Cloaked, the window stays invisible until it has something
+        // complete to show.
         bool animate = AnimatesOpen;
-        if (animate) WindowEffects.SetCloaked(this, true);
+        WindowEffects.SetCloaked(this, true);
         Show();
         Mark("show");
         // Re-check the backdrop on every open: the user can switch transparency
@@ -517,8 +529,17 @@ internal sealed class PanelWindow : Window
         }
         else
         {
+            // Nothing is in flight to be disturbed here, so the widgets are woken
+            // while the window is still cloaked and the panel is re-laid-out and
+            // re-anchored around whatever their cached readings changed. Then one
+            // composed frame is waited for, exactly as BeginReveal does, so the
+            // panel becomes visible already complete rather than as an empty
+            // rectangle that fills in afterwards.
             _manager.SetPanelVisible(true);
             Mark("widgets");
+            UpdateLayout();
+            ApplyPosition();
+            BeginUncloak();
         }
         LastOpenTrace = trace.ToString();
     }
@@ -583,6 +604,25 @@ internal sealed class PanelWindow : Window
             WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
             WindowEffects.SetCloaked(this, false);
             AnimateOpen();
+        };
+        CompositionTarget.Rendering += _reveal;
+    }
+
+    /// <summary>
+    /// The no-animation reveal: wait for one complete composed frame, then uncloak.
+    /// Same two-tick reasoning as <see cref="BeginReveal"/> — Rendering fires ahead
+    /// of the frame it belongs to, so the second tick is the first moment a frame
+    /// with the finished panel in it exists.
+    /// </summary>
+    private void BeginUncloak()
+    {
+        CancelReveal();
+        _revealFrames = 0;
+        _reveal = (_, _) =>
+        {
+            if (++_revealFrames < 2) return;
+            CancelReveal();
+            WindowEffects.SetCloaked(this, false);
         };
         CompositionTarget.Rendering += _reveal;
     }
