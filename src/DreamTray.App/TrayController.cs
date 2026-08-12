@@ -75,17 +75,34 @@ internal sealed class TrayController : IDisposable
     public void ShowPanel()
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
+        bool built = false;
         if (_panel == null)
         {
+            // Prewarm should have done this at idle; getting here means the click beat
+            // it, and this one open pays for the whole panel.
             _panel = new PanelWindow(_services, OpenSettings);
             _panel.DismissedByCaller = PointerOverIcon;
+            built = true;
         }
-        _panel.ShowNear(_icon?.GetIconRect() ?? Rect.Empty);
+        long afterBuild = clock.ElapsedMilliseconds;
+
+        // A cross-process call into explorer's tray. It is not ours to make faster,
+        // so it is measured separately rather than folded into the panel's own time.
+        var iconRect = _icon?.GetIconRect() ?? Rect.Empty;
+        long afterRect = clock.ElapsedMilliseconds;
+
+        _panel.ShowNear(iconRect);
         // Everything above runs on the UI thread between the click and the panel
         // being composed, so anything slow in a widget's OnShown shows up here as a
-        // late flyout. Logged only when it is long enough for a user to notice.
+        // late flyout. Logged only when it is long enough for a user to notice, with
+        // the per-phase split so a slow one names itself.
         if (clock.ElapsedMilliseconds >= 100)
-            Logging.Log.Write($"panel open took {clock.ElapsedMilliseconds} ms on the UI thread");
+        {
+            Logging.Log.Write(
+                $"panel open took {clock.ElapsedMilliseconds} ms on the UI thread " +
+                $"(build {afterBuild}{(built ? "" : " cached")}, icon rect {afterRect - afterBuild}, " +
+                $"{_panel.LastOpenTrace})");
+        }
     }
 
     /// <summary>

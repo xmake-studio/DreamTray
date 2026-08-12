@@ -1,4 +1,5 @@
 using System.Windows.Threading;
+using Microsoft.Win32;
 using DreamTray.Display;
 using DreamTray.Logging;
 using DreamTray.Plugins;
@@ -41,10 +42,15 @@ public sealed class AppServices : IDisposable
         };
         Sensors = new SensorSampler(dispatcher, Log.Write);
         Brightness = new BrightnessService(Log.Write);
-        // Scan displays now, in the background, so the first panel open finds a list
-        // waiting rather than paying for a WMI query and a DDC round trip per monitor.
-        Brightness.WarmUp();
         DisplayModes = new DisplayModeService(Log.Write);
+        // Scan displays now, in the background, so the first panel open finds both
+        // lists waiting rather than paying for a WMI query and a DDC round trip per
+        // monitor, and for a CCD query plus a mode enumeration per output.
+        Brightness.WarmUp();
+        DisplayModes.WarmUp();
+        // Docks, hotplugs and mode changes made outside DreamTray all land here; both
+        // scans are re-run off this thread so the panel never opens onto a stale list.
+        SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
         Tdp = new TdpService(Log.Write);
         PowerPolicy = new PowerPolicyService(Log.Write);
         Autostart = new AutostartService(Log.Write);
@@ -123,8 +129,15 @@ public sealed class AppServices : IDisposable
     /// <summary>A host view scoped to one plugin or widget's settings bag.</summary>
     public IPluginHost CreateHost(IStorage storage) => new Host(this, storage);
 
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e)
+    {
+        DisplayModes.RefreshAsync();
+        Brightness.RefreshAsync();
+    }
+
     public void Dispose()
     {
+        SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         Plugins.Dispose();
         Sensors.Dispose();
         Brightness.Dispose();
@@ -175,6 +188,9 @@ public sealed class AppServices : IDisposable
         public IReadOnlyList<DisplayMode> GetModes(string deviceName) => s.DisplayModes.GetModes(deviceName);
         public DisplayMode? GetCurrentMode(string deviceName) => s.DisplayModes.GetCurrentMode(deviceName);
         public bool SetMode(string deviceName, DisplayMode mode) => s.DisplayModes.SetMode(deviceName, mode);
+
+        public void RefreshDisplayModesAsync(Action? onCompleted = null) =>
+            s.DisplayModes.RefreshAsync(onCompleted);
 
         public bool SetWindowsDarkMode(bool dark) => s.Theme.SetWindowsDarkMode(dark);
 

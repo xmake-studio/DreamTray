@@ -86,23 +86,47 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
         return _root;
     }
 
-    protected override void OnShown() => Rebuild();
-
-    private DisplayDevice? ResolveDevice()
+    protected override void OnShown()
     {
-        var devices = Hardware.GetDisplayDevices();
-        if (devices.Count == 0) return null;
-        // A saved device that has been unplugged falls back to the primary rather
-        // than showing an empty widget.
-        return devices.FirstOrDefault(d => d.DeviceName == DeviceName) ?? devices[0];
+        // Draw what the last scan found, immediately, and re-scan behind the panel.
+        // The scan is a CCD query plus one EnumDisplaySettings call per supported
+        // mode — several hundred driver round trips — and doing it here on the UI
+        // thread held the whole panel back: every widget builds and the window
+        // composes after this returns, so a busy GPU driver delayed the flyout by
+        // however long it took to answer.
+        Rebuild();
+        RefreshModes();
     }
+
+    /// <summary>Re-scan in the background and rebuild when the new list lands.</summary>
+    private void RefreshModes()
+    {
+        var root = _root;
+        if (root == null) return;
+        Hardware.RefreshDisplayModesAsync(() => root.Dispatcher.BeginInvoke(() =>
+        {
+            // The panel may have closed, or the widget been removed, while the scan
+            // was out; rebuilding a detached view is harmless but pointless.
+            if (_root == root) Rebuild();
+        }));
+    }
+
+    private DisplayDevice? ResolveDevice() => ResolveDevice(Hardware.GetDisplayDevices());
+
+    private DisplayDevice? ResolveDevice(IReadOnlyList<DisplayDevice> devices) =>
+        devices.Count == 0
+            ? null
+            // A saved device that has been unplugged falls back to the primary rather
+            // than showing an empty widget.
+            : devices.FirstOrDefault(d => d.DeviceName == DeviceName) ?? devices[0];
 
     private void Rebuild()
     {
         if (_root == null) return;
         _root.Children.Clear();
 
-        var device = ResolveDevice();
+        var devices = Hardware.GetDisplayDevices();
+        var device = ResolveDevice(devices);
         if (device == null)
         {
             _root.Children.Add(Ui.Caption("No display found."));
@@ -112,7 +136,6 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
         // The picker stays in the body rather than on the title row: it is one of
         // three combos, and hoisting it would leave it out of line with the two it
         // qualifies.
-        var devices = Hardware.GetDisplayDevices();
         if (devices.Count > 1)
         {
             _root.Children.Add(Ui.LabelRow("Display", Ui.Combo(devices, device, d =>
@@ -194,7 +217,10 @@ internal sealed class DisplayModeWidget(IWidgetContext context) : WidgetBase(con
     {
         if (!Hardware.SetMode(deviceName, mode))
             Host.Notify("DreamTray", $"{mode} was rejected by the display.");
-        Rebuild();
+        // The cached snapshot still describes the old mode, so rebuild only once a
+        // scan taken after the change has landed — otherwise the combos would snap
+        // back to what was selected a moment ago.
+        RefreshModes();
     }
 
     // ---- background rule ----

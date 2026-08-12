@@ -38,10 +38,24 @@ public interface IHardwareControl
     /// different identity space from <see cref="GetDisplays"/>: brightness is per
     /// physical panel, display modes are per GDI adapter output.
     /// </summary>
+    /// <remarks>
+    /// These three answer from the last scan and never touch the graphics stack, so
+    /// they are safe on the UI thread. The scan behind them costs one CCD query plus
+    /// an <c>EnumDisplaySettings</c> call per supported mode — hundreds of driver
+    /// round trips — so ask for a fresh one with <see cref="RefreshDisplayModesAsync"/>
+    /// rather than blocking on it.
+    /// </remarks>
     IReadOnlyList<DisplayDevice> GetDisplayDevices();
     IReadOnlyList<DisplayMode> GetModes(string deviceName);
     DisplayMode? GetCurrentMode(string deviceName);
     bool SetMode(string deviceName, DisplayMode mode);
+
+    /// <summary>
+    /// Re-scan display devices and their modes without blocking the caller, then
+    /// invoke <paramref name="onCompleted"/> on a background thread — marshal it
+    /// yourself before touching UI.
+    /// </summary>
+    void RefreshDisplayModesAsync(Action? onCompleted = null) => onCompleted?.Invoke();
 
     // ---- Windows theme ----
     /// <summary>Switch the Windows apps+system theme. Returns false if the write failed.</summary>

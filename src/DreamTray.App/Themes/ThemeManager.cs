@@ -17,10 +17,22 @@ namespace DreamTray.App.Themes;
 /// </summary>
 internal static class ThemeManager
 {
+    private static (ResourceDictionary? Resources, bool Dark, bool Translucent, Color Accent) _applied;
+
     /// <summary>Repaint every control for the given theme.</summary>
     public static void Apply(ResourceDictionary resources, bool dark, bool translucent)
     {
         var accent = ReadAccentColor(dark);
+
+        // Every Set below replaces a dictionary entry, and replacing one makes WPF
+        // walk the whole visual tree invalidating anything that resolved that key —
+        // thirty tree walks plus the relayout they trigger. The panel re-applies the
+        // theme on every open (it has to re-check the backdrop), so without this
+        // guard each click paid for a full re-theme of a UI whose colours had not
+        // moved. That cost scales with the tree and with how busy the machine is,
+        // which is what made a slow open look random.
+        if (_applied == (resources, dark, translucent, accent)) return;
+        _applied = (resources, dark, translucent, accent);
 
         // Surfaces. These are the WinUI "solid background" and "card background"
         // values the Settings app uses, as opaque colours rather than low-alpha

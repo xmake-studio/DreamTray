@@ -35,8 +35,19 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
         3600, 7200, 10800, 14400, 18000, 0,
     ];
 
+    /// <summary>
+    /// Everything the widget draws, as one reading of the active power scheme.
+    /// Held so the panel can render without going back to the power manager: each
+    /// value costs a <c>PowerGetActiveScheme</c> plus a <c>PowerRead*ValueIndex</c>,
+    /// and there are four of them, which is not work to be doing between a tray
+    /// click and the flyout appearing.
+    /// </summary>
+    private sealed record PolicyState(
+        bool HasBattery, bool OnAc, bool HasLid, int? Timeout, LidAction? Lid);
+
     private StackPanel? _root;
     private TextBlock? _source;
+    private PolicyState? _state;
     private bool _onAc;
 
     public override string Title => "Sleep";
@@ -50,7 +61,7 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
     {
         get
         {
-            if (Policy?.HasBattery != true) return null;
+            if (_state?.HasBattery != true) return null;
             _source ??= Ui.Caption("");
             _source.TextWrapping = TextWrapping.NoWrap;
             return _source;
@@ -63,18 +74,57 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
     {
         _root = new StackPanel();
         SystemEvents.PowerModeChanged += OnPowerModeChanged;
+        // The first read is synchronous, and it is the one that can afford to be: the
+        // panel is built once at idle, well before the user clicks the tray icon.
+        _state = ReadState();
         Rebuild();
         return _root;
     }
 
-    protected override void OnShown() => Rebuild();
+    protected override void OnShown()
+    {
+        // Draw the last reading straight away and re-read behind the panel — the plan
+        // can have been edited in Windows Settings, or the charger pulled, since the
+        // panel was last on screen.
+        Rebuild();
+        RefreshState();
+    }
+
+    /// <summary>Read the scheme on a pool thread, then rebuild on the UI thread.</summary>
+    private void RefreshState()
+    {
+        var root = _root;
+        if (root == null) return;
+        ThreadPool.QueueUserWorkItem(_ =>
+        {
+            var state = ReadState();
+            root.Dispatcher.BeginInvoke(() =>
+            {
+                // The widget may have been removed while the read was out.
+                if (_root != root) return;
+                _state = state;
+                Rebuild();
+            });
+        });
+    }
+
+    /// <summary>Take one consistent reading of the plan. Not for the UI thread.</summary>
+    private PolicyState? ReadState()
+    {
+        var policy = Policy;
+        if (policy == null) return null;
+        bool onAc = policy.IsOnAcPower;
+        return new PolicyState(policy.HasBattery, onAc, policy.HasLid,
+                               policy.GetSleepTimeout(onAc),
+                               policy.GetLidCloseAction(onAc));
+    }
 
     private void OnPowerModeChanged(object? sender, PowerModeChangedEventArgs e)
     {
         // Fires on a pool thread, and only StatusChange concerns us: it is what
         // Windows raises when the power source flips.
         if (e.Mode != PowerModes.StatusChange || _root == null) return;
-        _root.Dispatcher.BeginInvoke(Rebuild);
+        RefreshState();
     }
 
     private void Rebuild()
@@ -82,22 +132,22 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
         if (_root == null) return;
         _root.Children.Clear();
 
-        var policy = Policy;
-        if (policy == null)
+        var state = _state;
+        if (state == null)
         {
             _root.Children.Add(Ui.Caption("The active power plan could not be read."));
             return;
         }
 
-        _onAc = policy.IsOnAcPower;
+        _onAc = state.OnAc;
 
-        if (policy.HasBattery)
+        if (state.HasBattery)
         {
             _source ??= Ui.Caption("");
             _source.Text = _onAc ? "Plugged in" : "On battery";
         }
 
-        int? timeout = policy.GetSleepTimeout(_onAc);
+        int? timeout = state.Timeout;
         if (timeout == null)
         {
             _root.Children.Add(Ui.Caption("The standby timeout is not available on this plan."));
@@ -112,15 +162,15 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
             _root.Children.Add(Ui.LabelRow("Sleep after", Ui.Combo(choices, timeout.Value, seconds =>
             {
                 if (seconds == timeout.Value) return;
-                if (!policy.SetSleepTimeout(_onAc, seconds))
+                if (Policy?.SetSleepTimeout(_onAc, seconds) == false)
                     Host.Notify("DreamTray", "Windows refused the standby timeout change.");
-                Rebuild();
+                RefreshState();
             }, TimeoutLabel)));
         }
 
-        if (!policy.HasLid) return;
+        if (!state.HasLid) return;
 
-        var action = policy.GetLidCloseAction(_onAc);
+        var action = state.Lid;
         if (action == null)
         {
             _root.Children.Add(Ui.Caption("The lid-close action is not available on this plan."));
@@ -155,7 +205,7 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
         var policy = Policy;
         if (policy != null && !policy.SetLidCloseAction(_onAc, action))
             Host.Notify("DreamTray", "Windows refused the lid-close change.");
-        Rebuild();
+        RefreshState();
     }
 
     private static string TimeoutLabel(int seconds) => seconds switch
@@ -176,24 +226,20 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
 
     public override FrameworkElement? CreateSettingsView()
     {
-        var policy = Policy;
-        if (policy == null) return null;
+        var state = _state;
+        if (state == null) return null;
 
         var children = new List<UIElement>
         {
-            Ui.Caption(policy.HasBattery
+            Ui.Caption(state.HasBattery
                 ? "Windows power-plan settings for the power source in use right now."
                 : "Windows power-plan settings for the active plan."),
         };
 
-        if (policy.HasLid)
+        if (state.HasLid && state.Lid is { } action)
         {
-            var action = policy.GetLidCloseAction(policy.IsOnAcPower);
-            if (action != null)
-            {
-                children.Add(Ui.Separator());
-                children.Add(Ui.LabelRow("On lid close", LidCombo(action.Value)));
-            }
+            children.Add(Ui.Separator());
+            children.Add(Ui.LabelRow("On lid close", LidCombo(action)));
         }
 
         return Ui.SettingsPanel([.. children]);

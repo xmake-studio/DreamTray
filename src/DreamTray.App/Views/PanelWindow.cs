@@ -90,6 +90,10 @@ internal sealed class PanelWindow : Window
     private EventHandler? _reveal;
     private int _revealFrames;
 
+    // Theme and backdrop the window chrome was last built for. Null until the first
+    // pass, so that one always runs. See ApplyWindowEffects.
+    private (bool Dark, bool Translucent)? _appliedAppearance;
+
     public PanelWindow(AppServices services, Action openSettings)
     {
         _services = services;
@@ -429,9 +433,29 @@ internal sealed class PanelWindow : Window
 
     // ---------------------------------------------------------------- show / hide
 
+    /// <summary>
+    /// Where the time went in the last <see cref="ShowNear"/>, for the log line the
+    /// tray controller writes when an open was slow enough to notice. Every phase
+    /// here runs on the UI thread between the click and the flyout appearing, so a
+    /// number that stands out names the culprit directly rather than leaving the
+    /// next person to guess which widget went to the hardware.
+    /// </summary>
+    internal string LastOpenTrace { get; private set; } = "";
+
     /// <summary>Position next to the tray icon and show.</summary>
     public void ShowNear(Rect iconRect)
     {
+        var clock = System.Diagnostics.Stopwatch.StartNew();
+        var trace = new System.Text.StringBuilder();
+        double last = 0;
+        void Mark(string phase)
+        {
+            double now = clock.Elapsed.TotalMilliseconds;
+            if (trace.Length > 0) trace.Append(", ");
+            trace.Append($"{phase} {now - last:F0}");
+            last = now;
+        }
+
         // Cancel a close that is still playing, otherwise its Completed handler
         // would hide the panel we are in the middle of reopening.
         StopAnimations();
@@ -447,10 +471,12 @@ internal sealed class PanelWindow : Window
         bool animate = AnimatesOpen;
         if (animate) WindowEffects.SetCloaked(this, true);
         Show();
+        Mark("show");
         // Re-check the backdrop on every open: the user can switch transparency
         // effects on or off while the panel is alive, and the window is created
         // once and reused, so SourceInitialized alone would never see the change.
         ApplyWindowEffects();
+        Mark("effects");
         SetAnchor(iconRect);
         // Height is content-driven, so lay out before measuring the chrome or
         // positioning — otherwise both run on a stale (zero) height and the panel
@@ -458,10 +484,16 @@ internal sealed class PanelWindow : Window
         UpdateLayout();
         UpdateScrollerMaxHeight();
         UpdateLayout();
+        Mark("layout");
         ApplyPosition();
         Activate();
+        Mark("activate");
+        // Every widget's OnShown runs from here. Anything that reads the hardware
+        // rather than its own cache lands in this number.
         _manager.SetPanelVisible(true);
+        Mark("widgets");
         if (animate) BeginReveal();
+        LastOpenTrace = trace.ToString();
     }
 
     /// <summary>
@@ -788,17 +820,29 @@ internal sealed class PanelWindow : Window
 
     private void ApplyWindowEffects()
     {
-        WindowEffects.SetDarkMode(this, _services.Theme.IsDark);
-        // SetCornerRadius also turns DWM's own rounding off, and TryApplyBackdrop
-        // below can put it back, so force the region to be rebuilt rather than
-        // trusting the cached size.
-        _regionWidth = _regionHeight = -1;
-        UpdateCornerRadius();
+        bool dark = _services.Theme.IsDark;
 
         // Acrylic is the material Windows uses for its own tray flyouts. If DWM
         // refuses it — an older build, or transparency effects switched off — the
         // theme falls back to opaque surfaces and the window paints them itself.
+        // Asking is a registry read and one DWM attribute write, and the answer is
+        // what everything below depends on, so it happens on every open.
         bool translucent = WindowEffects.TryApplyBackdrop(this, WindowEffects.Backdrop.Acrylic);
+
+        // The rest only matters when the appearance actually moved. Re-theming and
+        // rebuilding the corner region on every open cost a full invalidate-and-
+        // relayout of the panel for a result identical to the frame before it.
+        if (_appliedAppearance == (dark, translucent)) return;
+        _appliedAppearance = (dark, translucent);
+
+        WindowEffects.SetDarkMode(this, dark);
+        // SetCornerRadius also turns DWM's own rounding off, and the backdrop change
+        // above can put it back, so force the region to be rebuilt rather than
+        // trusting the cached size. Ordinary resizes are covered by the
+        // WM_WINDOWPOSCHANGED path, which self-heals.
+        _regionWidth = _regionHeight = -1;
+        UpdateCornerRadius();
+
         (Application.Current as App)?.ApplyTheme(translucent);
 
         if (translucent)
