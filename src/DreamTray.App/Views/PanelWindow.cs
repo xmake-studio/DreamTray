@@ -21,6 +21,9 @@ internal sealed class PanelWindow : Window
 {
     private const double PanelWidth = 340;
     private const double EdgeMargin = 12;
+    // The floor on the panel, so a monitor too short for it still shows a header and
+    // something scrollable rather than collapsing to nothing.
+    private const double MinPanelHeight = 180;
     private const double CornerRadius = 16;
     // What DWM's own DWMWCP_ROUND arc measures, in dips. The translucent path leans on
     // that rounding instead of a region (see ApplyWindowEffects), and the hairline
@@ -63,11 +66,6 @@ internal sealed class PanelWindow : Window
     // left corner — so without re-anchoring, the panel drifts off the work area.
     private Point _anchor;
     private bool _anchored;
-
-    // Size the rounded-corner region was last built for, in device pixels. The region
-    // does not scale with the window, so it has to be rebuilt whenever these change.
-    private int _regionWidth = -1;
-    private int _regionHeight = -1;
 
     // The outline that traces the window's corners; its radius has to match whichever
     // rounding is in force. Set once by BuildLayout.
@@ -211,19 +209,25 @@ internal sealed class PanelWindow : Window
         header.Children.Add(_editButton);
         header.Children.Add(settingsButton);
 
-        // The cap is recomputed from the work area on every open (see
-        // UpdateScrollerMaxHeight); this initial value only has to be sane for the
-        // first measure pass.
+        // No cap of its own: the height budget is put on the window (see
+        // ApplyHeightBudget) and this scroller is what gives way when the window
+        // runs out of room.
         _scroller = new ScrollViewer
         {
             Style = Ui.Find("ThinScrollViewer"),
-            MaxHeight = 620,
             Content = _list,
         };
 
         var root = new Grid { Margin = new Thickness(14, 12, 14, 14) };
         root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
-        root.RowDefinitions.Add(new RowDefinition { Height = GridLength.Auto });
+        // Star, not Auto. Measured against an unbounded window — which is what
+        // SizeToContent does — a star row asks for exactly its content, so the panel
+        // still shrinks to fit its widgets. The difference is on the way down: an Auto
+        // row insists on its full desired height at arrange and simply overflows the
+        // window, which is the list being cut off mid-widget. A star row gives up the
+        // space it does not have, and a ScrollViewer arranged shorter than its content
+        // scrolls.
+        root.RowDefinitions.Add(new RowDefinition { Height = new GridLength(1, GridUnitType.Star) });
         Grid.SetRow(header, 0);
         Grid.SetRow(_scroller, 1);
         root.Children.Add(header);
@@ -496,6 +500,12 @@ internal sealed class PanelWindow : Window
         // appear. Cloaked, the window stays invisible until it has something
         // complete to show.
         bool animate = AnimatesOpen;
+        // Both before Show: the first layout happens inside it, and a layout that runs
+        // without a height budget is one WPF gets to clamp on its own terms. Neither
+        // call needs the window — the anchor comes from the caller, and the budget
+        // from the monitor it lands on.
+        SetAnchor(iconRect);
+        ApplyHeightBudget();
         WindowEffects.SetCloaked(this, true);
         Show();
         Mark("show");
@@ -504,12 +514,11 @@ internal sealed class PanelWindow : Window
         // once and reused, so SourceInitialized alone would never see the change.
         ApplyWindowEffects();
         Mark("effects");
-        SetAnchor(iconRect);
-        // Height is content-driven, so lay out before measuring the chrome or
-        // positioning — otherwise both run on a stale (zero) height and the panel
-        // lands off the bottom of the screen.
-        UpdateLayout();
-        UpdateScrollerMaxHeight();
+        // Once the window exists the scale can be read from it as well, so the budget
+        // is worked out again now that both answers are available.
+        ApplyHeightBudget();
+        // Height is content-driven, so lay out before positioning — otherwise that
+        // runs on a stale (zero) height and the panel lands off the bottom.
         UpdateLayout();
         Mark("layout");
         ApplyPosition();
@@ -542,6 +551,7 @@ internal sealed class PanelWindow : Window
             BeginUncloak();
         }
         LastOpenTrace = trace.ToString();
+        LogGeometry("open");
     }
 
     /// <summary>
@@ -601,6 +611,10 @@ internal sealed class PanelWindow : Window
         {
             if (++_revealFrames < 2) return;
             CancelReveal();
+            // Last chance to catch a region that does not match the window it is on:
+            // after this the panel is on screen, and a short one takes the bottom of
+            // the list with it.
+            UpdateCornerRadius();
             WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
             WindowEffects.SetCloaked(this, false);
             AnimateOpen();
@@ -622,6 +636,9 @@ internal sealed class PanelWindow : Window
         {
             if (++_revealFrames < 2) return;
             CancelReveal();
+            // As in BeginReveal: the region is checked against the window one last
+            // time before the panel is allowed on screen.
+            UpdateCornerRadius();
             WindowEffects.SetCloaked(this, false);
         };
         CompositionTarget.Rendering += _reveal;
@@ -645,6 +662,7 @@ internal sealed class PanelWindow : Window
             // Deferred from ShowNear so the sensor traffic it starts cannot resize
             // the window mid-flight.
             _manager.SetPanelVisible(true);
+            LogGeometry("widgets");
         });
     }
 
@@ -773,24 +791,30 @@ internal sealed class PanelWindow : Window
     }
 
     /// <summary>
-    /// Cap the widget list at whatever the current monitor's work area leaves after
-    /// the header and margins, so a long list scrolls instead of growing past the
-    /// screen edge. Small screens and tall taskbars both land here.
+    /// Give the window itself the work area as its height budget, so a long list
+    /// scrolls instead of growing past the screen edge.
+    ///
+    /// The cap belongs on the window rather than on the widget list because WPF puts
+    /// one there regardless: SizeToContent will not size a window past the monitor,
+    /// and when it hits that limit it clamps the HWND while the content inside stays
+    /// laid out for the height it asked for. The panel is then a window shorter than
+    /// its own contents — rounded corners and all, with the last widget running off
+    /// the bottom edge — which is why capping only the list never fixed it. Setting a
+    /// budget that is always tighter than WPF's own keeps that clamp out of it, and
+    /// the star row below the header is what turns the shortfall into scrolling.
+    ///
+    /// The scale comes from the monitor the panel is anchored to, not from the
+    /// window: this runs before the panel has been positioned, and until then WPF's
+    /// transform still describes wherever the window happened to be created.
     /// </summary>
-    private void UpdateScrollerMaxHeight()
+    private void ApplyHeightBudget()
     {
-        double scale = WindowEffects.GetDpiScale(this);
+        double scale = _anchored ? WindowEffects.GetDpiScale(_anchor) : 0;
+        if (scale <= 0) scale = WindowEffects.GetDpiScale(this);
         if (scale <= 0) scale = 1;
 
-        double availableDips = WindowEffects.GetWorkArea(_anchor).Height / scale - 2 * EdgeMargin;
-
-        // Everything the window spends on chrome: root margins, the header, and the
-        // window border. Derived from the laid-out sizes rather than hardcoded, so
-        // it stays right if the header ever grows a row.
-        double chrome = ActualHeight - _scroller.ActualHeight;
-        if (chrome < 0 || double.IsNaN(chrome)) chrome = 0;
-
-        _scroller.MaxHeight = Math.Max(120, availableDips - chrome);
+        double available = WindowEffects.GetWorkArea(_anchor).Height / scale - 2 * EdgeMargin;
+        MaxHeight = Math.Max(MinPanelHeight, available);
     }
 
     /// <summary>
@@ -801,6 +825,35 @@ internal sealed class PanelWindow : Window
     private void OnSizeChanged(object sender, SizeChangedEventArgs e)
     {
         if (_anchored && IsVisible) ApplyPosition();
+        if (!IsVisible) return;
+        // The HWND is resized after this pass, so the region cannot be checked here —
+        // but once the dispatcher comes back round it has happened, whatever order the
+        // messages arrived in. Cheap, and it is the backstop for the window growing
+        // under a region that stayed behind.
+        Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.Loaded,
+            new Action(() => { UpdateCornerRadius(); LogGeometry("resize"); }));
+    }
+
+    /// <summary>
+    /// One line of everything that decides how tall the panel gets, so a report of it
+    /// being cut off can be read rather than guessed at. The two heights that matter
+    /// are WPF's (<c>win</c>) and the window manager's (<c>hwnd</c>): the list is
+    /// clipped exactly when the second is the smaller of the two, and whichever of
+    /// the caps below equals it is the one doing the clipping.
+    /// </summary>
+    private void LogGeometry(string phase)
+    {
+        WindowEffects.TryGetSize(this, out int wPx, out int hPx);
+        Rect work = WindowEffects.GetWorkArea(_anchor);
+        Rect region = WindowEffects.GetRegionBox(this);
+        Logging.Log.Write(
+            $"panel {phase}: win {ActualWidth:F0}x{ActualHeight:F0} dip, hwnd {wPx}x{hPx} px, " +
+            $"region {(region.IsEmpty ? "none" : $"{region.Width:F0}x{region.Height:F0}")}, " +
+            $"max {MaxHeight:F0} dip, scale win {WindowEffects.GetDpiScale(this):F2} " +
+            $"mon {WindowEffects.GetDpiScale(_anchor):F2}, work {work.Width:F0}x{work.Height:F0} px, " +
+            $"list viewport {_scroller.ViewportHeight:F0} extent {_scroller.ExtentHeight:F0}, " +
+            $"sizeToContent {SizeToContent}, top {Top:F0}");
     }
 
     /// <summary>
@@ -813,20 +866,29 @@ internal sealed class PanelWindow : Window
     /// what it stops covering, the clipped widgets are left behind on the desktop as
     /// a ghost of themselves.
     ///
-    /// Comparing against the last size also makes this self-healing: the message
-    /// arrives on every frame of a slide too, so a region that has gone stale is
-    /// corrected on the next move instead of waiting for the next resize.
+    /// The check is against the region the window manager actually has, not against
+    /// a size remembered here. Remembered state was the bug: every path that resized
+    /// the window without the message arriving — or that arrived while the cache said
+    /// "already done" — left a region shorter than the window, and a short region
+    /// clips the bottom off the panel while every number WPF reports stays correct.
+    /// Asking GDI costs one call and cannot drift.
     /// </summary>
-    private void UpdateCornerRadius()
+    private void UpdateCornerRadius(int width = 0, int height = 0)
     {
         // With a backdrop live the corners belong to DWM, which rounds the window
         // itself at any size — there is no region to keep in step.
         if (_dwmCorners) return;
-        if (!WindowEffects.TryGetSize(this, out int width, out int height)) return;
-        if (width == _regionWidth && height == _regionHeight) return;
-        _regionWidth = width;
-        _regionHeight = height;
-        WindowEffects.SetCornerRadius(this, CornerRadius);
+        // A size from the caller is one the window may not admit to yet; without one,
+        // ask.
+        if ((width <= 0 || height <= 0)
+            && !WindowEffects.TryGetSize(this, out width, out height)) return;
+
+        // SetCornerRadius builds the region exclusive of the right and bottom edge,
+        // so a region that fits the window measures one larger in each direction.
+        // Anything else — shorter, taller, or absent — is rebuilt.
+        Rect box = WindowEffects.GetRegionBox(this);
+        if (box.Width == width + 1 && box.Height == height + 1) return;
+        WindowEffects.SetCornerRadius(this, CornerRadius, width, height);
     }
 
     private void OnSourceInitialized(object? sender, EventArgs e)
@@ -839,7 +901,17 @@ internal sealed class PanelWindow : Window
     private nint OnWindowMessage(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
     {
         const int WM_WINDOWPOSCHANGED = 0x0047;
-        if (msg == WM_WINDOWPOSCHANGED) UpdateCornerRadius();
+        if (msg == WM_WINDOWPOSCHANGED)
+        {
+            // The size in the message beats the one the window will admit to: adding
+            // a widget resizes the HWND, and asking here still answers with the rect
+            // from before it. That is what left the panel taller than the region
+            // clipping it until the next open rebuilt one.
+            if (WindowEffects.TryReadWindowPos(lParam, out int width, out int height))
+                UpdateCornerRadius(width, height);
+            else
+                UpdateCornerRadius();
+        }
         return nint.Zero;
     }
 
@@ -945,19 +1017,10 @@ internal sealed class PanelWindow : Window
         // With no backdrop there is nothing for a region to spoil, and the larger
         // 16-dip radius is the look this panel wants, so the region stays.
         _dwmCorners = translucent;
-        if (translucent)
-        {
-            WindowEffects.ClearCornerRegion(this);
-            _regionWidth = _regionHeight = -1;
-        }
-        else
-        {
-            // The backdrop change above can restore DWM's rounding, so force the
-            // region to be rebuilt rather than trusting the cached size. Ordinary
-            // resizes are covered by the WM_WINDOWPOSCHANGED path, which self-heals.
-            _regionWidth = _regionHeight = -1;
-            UpdateCornerRadius();
-        }
+        if (translucent) WindowEffects.ClearCornerRegion(this);
+        // The backdrop change above can restore DWM's rounding, so the region is put
+        // back on the spot rather than waiting for the next resize.
+        else UpdateCornerRadius();
 
         if (_frame is not null)
             _frame.CornerRadius = new CornerRadius(translucent ? DwmCornerRadius : CornerRadius);

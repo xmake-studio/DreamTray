@@ -62,12 +62,21 @@ internal static class WindowEffects
     /// </summary>
     public static void SetCornerRadius(Window window, double radiusDips)
     {
+        if (!TryGetSize(window, out int width, out int height)) return;
+        SetCornerRadius(window, radiusDips, width, height);
+    }
+
+    /// <summary>
+    /// As above, for a size the caller already knows — which is the only correct one
+    /// to use while handling WM_WINDOWPOSCHANGED. The message carries the new size in
+    /// its WINDOWPOS, and asking the window for it there can still return the rect it
+    /// had before the resize; a region built from that answer is short by exactly the
+    /// resize, and it clips the window until something else happens to rebuild it.
+    /// </summary>
+    public static void SetCornerRadius(Window window, double radiusDips, int width, int height)
+    {
         nint hwnd = new WindowInteropHelper(window).Handle;
         if (hwnd == nint.Zero) return;
-        if (!GetWindowRect(hwnd, out RECT rect)) return;
-
-        int width = rect.right - rect.left;
-        int height = rect.bottom - rect.top;
         if (width <= 0 || height <= 0) return;
 
         // DWM's own rounding would cut a smaller arc out of our larger one, so it
@@ -185,6 +194,40 @@ internal static class WindowEffects
         return new Point(p.X, p.Y);
     }
 
+    /// <summary>
+    /// The bounding box of the clip region currently on the window, in window
+    /// coordinates and device pixels. Empty when the window has no region.
+    ///
+    /// This is the only honest answer to "is the region still the right size": the
+    /// region lives in the window manager, and anything we remember about it here is
+    /// a guess that can drift. A region shorter than the window clips the bottom off
+    /// it — with rounded corners, since that is what the region is — while every
+    /// number WPF reports stays perfectly correct.
+    /// </summary>
+    public static Rect GetRegionBox(Window window)
+    {
+        nint hwnd = new WindowInteropHelper(window).Handle;
+        if (hwnd == nint.Zero) return Rect.Empty;
+        // Returns one of the region-type constants, or ERROR (0) when there is none.
+        if (GetWindowRgnBox(hwnd, out RECT r) == 0) return Rect.Empty;
+        return new Rect(r.left, r.top, r.right - r.left, r.bottom - r.top);
+    }
+
+    /// <summary>
+    /// The size a WM_WINDOWPOSCHANGED is reporting, in device pixels. False when the
+    /// message is a move rather than a resize, or carries nothing usable.
+    /// </summary>
+    public static bool TryReadWindowPos(nint lParam, out int width, out int height)
+    {
+        width = height = 0;
+        if (lParam == nint.Zero) return false;
+        var pos = Marshal.PtrToStructure<WINDOWPOS>(lParam);
+        if ((pos.flags & SWP_NOSIZE) != 0) return false;
+        width = pos.cx;
+        height = pos.cy;
+        return width > 0 && height > 0;
+    }
+
     /// <summary>Outer size of a window in device pixels, straight from the OS.</summary>
     public static bool TryGetSize(Window window, out int width, out int height)
     {
@@ -236,9 +279,35 @@ internal static class WindowEffects
         return source?.CompositionTarget?.TransformToDevice.M11 ?? 1.0;
     }
 
+    /// <summary>
+    /// Scale factor of the monitor under a screen point, asked of the OS directly.
+    ///
+    /// The window-based overload reads WPF's cached transform, which is only correct
+    /// once the window has actually been placed on the monitor in question: in a
+    /// PerMonitorV2 process a window that has not been moved there yet still reports
+    /// the DPI it was created with. Anything that converts the monitor's rectangle
+    /// into DIPs *before* positioning has to ask about the monitor, not the window.
+    /// </summary>
+    public static double GetDpiScale(Point screenPoint)
+    {
+        var pt = new POINT { X = (int)screenPoint.X, Y = (int)screenPoint.Y };
+        nint monitor = MonitorFromPoint(pt, MONITOR_DEFAULTTONEAREST);
+        if (monitor == nint.Zero) return 0;
+        // Shcore is present from Windows 8.1 on; a failure just falls back to the
+        // window's own scale at the call site.
+        try
+        {
+            if (GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out uint dpiX, out _) != 0) return 0;
+            return dpiX <= 0 ? 0 : dpiX / 96.0;
+        }
+        catch (DllNotFoundException) { return 0; }
+        catch (EntryPointNotFoundException) { return 0; }
+    }
+
     // ---------------------------------------------------------------- interop
 
     private const int MONITOR_DEFAULTTONEAREST = 2;
+    private const int MDT_EFFECTIVE_DPI = 0;
 
     private const int SWP_NOSIZE = 0x0001;
     private const int SWP_NOZORDER = 0x0004;
@@ -250,6 +319,14 @@ internal static class WindowEffects
 
     [StructLayout(LayoutKind.Sequential)]
     private struct POINT { public int X, Y; }
+
+    [StructLayout(LayoutKind.Sequential)]
+    private struct WINDOWPOS
+    {
+        public nint hwnd, hwndInsertAfter;
+        public int x, y, cx, cy;
+        public uint flags;
+    }
 
     [StructLayout(LayoutKind.Sequential)]
     private struct RECT { public int left, top, right, bottom; }
@@ -275,6 +352,9 @@ internal static class WindowEffects
     [DllImport("user32.dll")]
     private static extern bool GetMonitorInfo(nint monitor, ref MONITORINFO info);
 
+    [DllImport("shcore.dll")]
+    private static extern int GetDpiForMonitor(nint monitor, int type, out uint dpiX, out uint dpiY);
+
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT point);
 
@@ -287,6 +367,9 @@ internal static class WindowEffects
 
     [DllImport("user32.dll")]
     private static extern int SetWindowRgn(nint hwnd, nint region, bool redraw);
+
+    [DllImport("user32.dll")]
+    private static extern int GetWindowRgnBox(nint hwnd, out RECT rect);
 
     [DllImport("gdi32.dll")]
     private static extern nint CreateRoundRectRgn(int left, int top, int right, int bottom, int width, int height);
