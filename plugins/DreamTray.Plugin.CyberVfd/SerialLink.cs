@@ -16,6 +16,11 @@ internal sealed class SerialLink : IDisposable
     private const string Probe = "CVFD?";
     private const string Magic = "CVFD1";
 
+    /// <summary>How long one port is given to answer — long enough to cover a device
+    /// that resets when the port is opened (ESP32-C3 boot is well under a second).</summary>
+    private const int ProbeWindowMs = 1800;
+    private const int ProbeRepeatMs = 400;
+
     private SerialPort? _port;
 
     public bool Connected => _port is { IsOpen: true };
@@ -52,11 +57,24 @@ internal sealed class SerialLink : IDisposable
             sp.Open();
             Thread.Sleep(60);
             sp.DiscardInBuffer();
-            sp.Write(Probe + "\n");
 
+            // The probe is repeated across the window, not sent once. Opening the port
+            // asserts the control lines, and on a USB-CDC device that is enough to make
+            // the firmware re-enumerate: a single probe sent into those first
+            // milliseconds is written to a device that is still booting and is simply
+            // lost, so the port looks like it is not the panel and the scan drops it —
+            // then comes back and knocks it over again. Re-asking until the window is
+            // out gets an answer from a device that woke up mid-handshake.
             var sw = Stopwatch.StartNew();
-            while (sw.ElapsedMilliseconds < 1000)
+            long nextProbeAt = 0;
+            while (sw.ElapsedMilliseconds < ProbeWindowMs)
             {
+                if (sw.ElapsedMilliseconds >= nextProbeAt)
+                {
+                    sp.Write(Probe + "\n");
+                    nextProbeAt = sw.ElapsedMilliseconds + ProbeRepeatMs;
+                }
+
                 string line;
                 try { line = sp.ReadLine(); }
                 catch (TimeoutException) { continue; }

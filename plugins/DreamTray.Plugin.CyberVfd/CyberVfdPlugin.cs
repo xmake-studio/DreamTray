@@ -25,7 +25,19 @@ public sealed class CyberVfdPlugin : DreamPluginBase
     private Thread? _worker;
     private volatile bool _stop;
     private volatile bool _reconnect;
-    private SystemSnapshot? _pending;
+    /// <summary>
+    /// Bumped by every <see cref="Stop"/>. A worker whose generation is stale exits
+    /// at the next check, so a <see cref="Start"/> that follows a join timeout can
+    /// never leave two link threads fighting over the same port.
+    /// </summary>
+    private volatile int _generation;
+
+    /// <summary>
+    /// The most recent sample, *kept* rather than consumed: the data frame is what
+    /// holds the tube on, so the worker re-sends the last one on its own clock when
+    /// the host sampler stalls. See <see cref="Run"/>.
+    /// </summary>
+    private SystemSnapshot? _latest;
 
     private string _status = "stopped";
 
@@ -83,14 +95,16 @@ public sealed class CyberVfdPlugin : DreamPluginBase
         if (_worker != null) return;
 
         _stop = false;
-        _worker = new Thread(Run) { IsBackground = true, Name = "cybervfd-link" };
+        int generation = _generation;
+        _worker = new Thread(() => Run(generation)) { IsBackground = true, Name = "cybervfd-link" };
         _worker.Start();
 
-        // One sample per second is what the firmware's display refresh expects, and
-        // it is also what the panel's 5 s watchdog needs to stay powered.
+        // One sample per second is what the firmware's display refresh expects. It is
+        // *not* what keeps the panel powered — the worker's own clock does that — so a
+        // stall anywhere upstream of this callback no longer blanks the tube.
         _subscription = Host.SubscribeSensors(TimeSpan.FromSeconds(1), snapshot =>
         {
-            lock (_gate) _pending = snapshot;
+            lock (_gate) _latest = snapshot;
             _wake.Set();
         });
 
@@ -104,9 +118,12 @@ public sealed class CyberVfdPlugin : DreamPluginBase
         _subscription = null;
 
         _stop = true;
+        // Retire this worker generation before the join. A port scan can be
+        // mid-handshake, so the thread may outlive the wait — but it will see the
+        // bumped generation and exit without touching the link, instead of running on
+        // alongside the one a later Start() creates.
+        _generation++;
         _wake.Set();
-        // A port scan can be mid-handshake (up to ~1 s per port), so the worker may
-        // outlive this join.
         _worker?.Join(3000);
         _worker = null;
 
@@ -128,32 +145,67 @@ public sealed class CyberVfdPlugin : DreamPluginBase
 
     // ---------------------------------------------------------------- worker
 
-    private void Run()
+    /// <summary>How often a data frame goes out. The firmware's watchdog is 5 s.</summary>
+    private const int FramePeriodMs = 1000;
+
+    /// <summary>
+    /// Retry delays for a failed connect attempt. A scan opens every COM port in
+    /// turn, and opening the panel's port makes the device re-enumerate — so
+    /// retrying on a flat 2 s tick during a hot plug keeps knocking the device over
+    /// just as it finishes coming up, which is what turned a single missed handshake
+    /// into an endless on/off cycle. Backing off gives it room to settle.
+    /// </summary>
+    private static readonly int[] RetryDelaysMs = [1000, 2000, 5000, 10000];
+
+    private void Run(int generation)
     {
-        while (!_stop)
+        long nextFrameAt = 0;
+        int attempt = 0;
+
+        while (!_stop && _generation == generation)
         {
             if (_reconnect) { _link.Disconnect(); _reconnect = false; }
 
-            if (!_link.Connected && !Reconnect()) continue;
+            if (!_link.Connected)
+            {
+                if (!Reconnect(attempt)) { attempt++; continue; }
+                attempt = 0;
+                // Re-arm the cadence: the device has just booted or re-enumerated and
+                // wants a frame now, not on whatever the old schedule said.
+                nextFrameAt = 0;
+            }
 
             // Control frames first (power/backlight/brightness), then the data frame.
             string[] frames;
-            SystemSnapshot? snapshot;
             lock (_gate)
             {
                 frames = _outbox.ToArray();
                 _outbox.Clear();
-                snapshot = _pending;
-                _pending = null;
             }
 
             bool ok = frames.All(_link.Send);
 
-            if (ok && snapshot != null)
+            long now = Environment.TickCount64;
+            if (ok && now >= nextFrameAt)
             {
                 // With the panel forced off there is nothing to draw, so skip the data
                 // frame; the firmware powers the tube down after 5 s without one.
-                if (DevicePower) ok = _link.Send(VfdFrame.Build(snapshot));
+                //
+                // Otherwise a frame goes out every second whether or not a new sample
+                // arrived. Sensor samples reach this plugin through the host sampler
+                // and the UI dispatcher, and a stall in either — a sensor read that
+                // throws and costs a full SensorService rebuild, a busy UI thread
+                // during a panel animation — used to mean no frame for longer than the
+                // watchdog allows, so the tube blanked and lit again on the next
+                // sample. Repeating the last sample is stale by at most a second or
+                // two; going dark is not a better answer.
+                SystemSnapshot? snapshot;
+                lock (_gate) snapshot = _latest;
+
+                if (DevicePower && snapshot != null)
+                    ok = _link.Send(VfdFrame.Build(snapshot, DateTime.Now));
+
+                nextFrameAt = now + FramePeriodMs;
             }
 
             if (!ok)
@@ -161,15 +213,29 @@ public sealed class CyberVfdPlugin : DreamPluginBase
                 // Re-queue undelivered control frames so they survive the reconnect.
                 lock (_gate) foreach (var f in frames) _outbox.Enqueue(f);
                 SetStatus("link lost");
+                Host.Log($"cybervfd: link lost on {_link.PortName ?? "?"}");
+                _link.Disconnect();
                 continue;
             }
 
-            if (snapshot != null) SetStatus($"connected on {_link.PortName}");
-            _wake.WaitOne(2000);
+            SetStatus($"connected on {_link.PortName}");
+
+            // Short waits so a control frame goes out promptly, with the next data
+            // frame as the deadline.
+            int wait = (int)Math.Clamp(nextFrameAt - Environment.TickCount64, 1, FramePeriodMs);
+            _wake.WaitOne(wait);
         }
+
+        // A stale generation (Stop timed out on the join and gave up on this thread)
+        // must not leave the port held open behind the plugin's back.
+        if (_generation != generation) _link.Disconnect();
     }
 
-    private bool Reconnect()
+    /// <summary>
+    /// One connect attempt, then a backoff wait. <paramref name="attempt"/> is the
+    /// number of consecutive failures so far.
+    /// </summary>
+    private bool Reconnect(int attempt)
     {
         bool manual = PortMode == "Manual";
         string port = ManualPort;
@@ -183,11 +249,12 @@ public sealed class CyberVfdPlugin : DreamPluginBase
             // The firmware may have just reset, so push the full current state.
             QueueFullState();
             SetStatus($"connected on {_link.PortName}");
+            Host.Log($"cybervfd: connected on {_link.PortName}");
             return true;
         }
 
         SetStatus(manual ? $"waiting for {port}" : "searching for the device…");
-        _wake.WaitOne(2000);
+        _wake.WaitOne(RetryDelaysMs[Math.Min(attempt, RetryDelaysMs.Length - 1)]);
         return false;
     }
 

@@ -1,5 +1,6 @@
 ﻿using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Controls.Primitives;
 using Microsoft.Win32;
 
 namespace DreamTray.App.Widgets.BuiltIn;
@@ -154,18 +155,7 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
         }
         else
         {
-            // A value set elsewhere may not be one of the presets; keep it in the list
-            // so the combo shows the truth instead of silently snapping to a neighbour.
-            var choices = TimeoutChoices.ToList();
-            if (!choices.Contains(timeout.Value)) choices.Insert(0, timeout.Value);
-
-            _root.Children.Add(Ui.LabelRow("Sleep after", Ui.Combo(choices, timeout.Value, seconds =>
-            {
-                if (seconds == timeout.Value) return;
-                if (Policy?.SetSleepTimeout(_onAc, seconds) == false)
-                    Host.Notify("DreamTray", "Windows refused the standby timeout change.");
-                RefreshState();
-            }, TimeoutLabel)));
+            foreach (var element in TimeoutPicker(timeout.Value)) _root.Children.Add(element);
         }
 
         if (!state.HasLid) return;
@@ -191,6 +181,70 @@ internal sealed class SleepWidget(IWidgetContext context) : WidgetBase(context)
             // Hibernate or shut down: a two-state switch would misrepresent it, so
             // show the full picker inline instead.
             _root.Children.Add(Ui.LabelRow("On lid close", LidCombo(action.Value), 8));
+        }
+    }
+
+    /// <summary>
+    /// The standby timeout as a stepped slider rather than a drop-down.
+    ///
+    /// There are sixteen presets, which is a drop-down long enough to need scrolling
+    /// inside a flyout that is itself dismissed on the first thing that steals focus —
+    /// the list kept folding away before the far end of it could be reached. A slider
+    /// over the same presets has no popup to lose: every value is one drag away, the
+    /// order (a minute on the left, Never on the right) carries the meaning the list
+    /// only implied, and the row above it reads out the value the thumb is on.
+    /// </summary>
+    private IEnumerable<UIElement> TimeoutPicker(int current)
+    {
+        // A value set elsewhere may not be one of the presets; splice it in at its
+        // proper place so the slider shows the truth instead of silently snapping to
+        // a neighbour. Never (0) sorts last, being the longest wait there is.
+        var choices = TimeoutChoices.ToList();
+        int index = choices.IndexOf(current);
+        if (index < 0)
+        {
+            index = choices.FindIndex(c => c == 0 || c > current);
+            if (index < 0) index = choices.Count;
+            choices.Insert(index, current);
+        }
+
+        var readout = Ui.Value(TimeoutLabel(current));
+        // Widest label the list can produce, so the slider below does not shuffle
+        // sideways as the thumb moves between "5 min" and "5 hours".
+        readout.MinWidth = 52;
+
+        int pending = current;
+        bool dragging = false;
+
+        var slider = Ui.Slider(0, choices.Count - 1, index, v =>
+        {
+            int seconds = choices[(int)Math.Round(v)];
+            readout.Text = TimeoutLabel(seconds);
+            pending = seconds;
+            // Keyboard and track clicks land a value and are done with it; a drag
+            // reports every step it passes through, and writing each one would mean a
+            // power-scheme write per pixel of travel.
+            if (!dragging) Commit(seconds);
+        });
+        slider.AddHandler(Thumb.DragStartedEvent, new DragStartedEventHandler((_, _) => dragging = true));
+        slider.AddHandler(Thumb.DragCompletedEvent, new DragCompletedEventHandler((_, _) =>
+        {
+            dragging = false;
+            Commit(pending);
+        }));
+
+        slider.Margin = new Thickness(0, 2, 0, 0);
+
+        yield return Ui.Row(Ui.Body("Sleep after"), readout);
+        yield return slider;
+
+        void Commit(int seconds)
+        {
+            if (seconds == current) return;
+            current = seconds;
+            if (Policy?.SetSleepTimeout(_onAc, seconds) == false)
+                Host.Notify("DreamTray", "Windows refused the standby timeout change.");
+            RefreshState();
         }
     }
 

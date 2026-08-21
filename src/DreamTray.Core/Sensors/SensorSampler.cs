@@ -30,6 +30,8 @@ public sealed class SensorSampler : IDisposable
     private Thread? _thread;
     private volatile bool _stop;
     private volatile int _periodMs = 1000;
+    /// <summary>UI-thread only: when the last sample actually reached subscribers.</summary>
+    private long _lastDeliveredTicks;
 
     public SystemSnapshot? Latest { get; private set; }
 
@@ -126,8 +128,19 @@ public sealed class SensorSampler : IDisposable
     private void Dispatch(SystemSnapshot snap)
     {
         // Background priority: sensor updates must never delay input or animation.
+        // The flip side is that a busy UI thread delays *them*, and a consumer on a
+        // deadline (the VFD plugin's link, whose device blanks after 5 s without a
+        // frame) has no way to tell that from a dead sensor. Log the gap so a stall
+        // shows up as a stall rather than as whatever the consumer does about it.
+        long queuedAt = Environment.TickCount64;
         _dispatcher.BeginInvoke(DispatcherPriority.Background, () =>
         {
+            long gap = Environment.TickCount64 - _lastDeliveredTicks;
+            if (_lastDeliveredTicks != 0 && gap > Math.Max(3 * _periodMs, 3000))
+                _log($"sensors: {gap} ms since the last delivered sample " +
+                     $"({Environment.TickCount64 - queuedAt} ms of it waiting on the UI thread)");
+            _lastDeliveredTicks = Environment.TickCount64;
+
             Subscription[] subs;
             lock (_gate) subs = _subs.ToArray();
 

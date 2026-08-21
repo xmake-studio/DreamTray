@@ -15,9 +15,17 @@ internal static class VfdFrame
     /// <summary>The firmware always expects sixteen per-thread load values.</summary>
     private const int ThreadCount = 16;
 
-    public static string Build(SystemSnapshot s)
+    /// <summary>
+    /// Build a frame from <paramref name="s"/>, clocked at <paramref name="clock"/>.
+    ///
+    /// The clock is passed separately because a frame is sent every second whether or
+    /// not a new sample arrived: a repeated sample shows metrics that are a moment
+    /// stale, but the panel's clock is the one thing on it that must never be — a
+    /// frozen minute reads as a hung display.
+    /// </summary>
+    public static string Build(SystemSnapshot s, DateTime? clock = null)
     {
-        var now = s.Timestamp;
+        var now = clock ?? s.Timestamp;
         string time = now.ToString("HH:mm", CultureInfo.InvariantCulture);
         // English uppercase day name + dd/MM, e.g. "THURSDAY 02/07".
         string date = now.DayOfWeek.ToString().ToUpperInvariant()

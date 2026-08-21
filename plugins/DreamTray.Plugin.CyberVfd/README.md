@@ -62,11 +62,20 @@ dark rather than showing wrong numbers. Control frames are `C|PWR|`, `C|BL|`,
 
 **Threading** ([`CyberVfdPlugin.cs`](CyberVfdPlugin.cs)) — all serial I/O runs on
 a dedicated `cybervfd-link` thread; a wedged COM port cannot stall the UI. The
-plugin subscribes to the host sampler at 1 Hz, which is what the firmware's
-refresh expects and what its 5-second watchdog needs to stay powered. Control
-frames go out ahead of the data frame, and undelivered ones are re-queued across a
-reconnect. With the panel powered off no data frame is sent, and the firmware
-powers the tube down on its own.
+plugin subscribes to the host sampler at 1 Hz, but the frame cadence is the
+worker's own clock, not the callback: a frame goes out every second, repeating the
+last sample if no new one arrived. Samples reach the plugin through the UI
+dispatcher, so anything that stalls the sampler or the UI thread for more than the
+firmware's 5-second watchdog would otherwise blank the tube and light it again on
+the next sample — a stale metric for a second beats a display that flickers. Only
+the clock field is always current. Control frames go out ahead of the data frame,
+and undelivered ones are re-queued across a reconnect. With the panel powered off
+no data frame is sent, and the firmware powers the tube down on its own.
+
+Failed connects back off (1 s → 2 s → 5 s → 10 s) instead of retrying on a fixed
+tick, and each port gets a ~1.8 s handshake window with the probe repeated through
+it. Opening a port re-enumerates a USB-CDC device, so a scan that retries too
+eagerly resets the panel just as it finishes booting and never converges.
 
 ## Layout
 
@@ -91,7 +100,10 @@ per-plugin `AssemblyLoadContext` resolves from.
   panel is powered and enumerated, then **Re-scan ports**; pin the port manually
   if auto-detect keeps missing it.
 - **"link lost"** — the port went away mid-write; the worker reconnects on its
-  own every 2 s.
+  own, backing off up to 10 s between attempts.
+- **Panel flickering on and off after a hot plug or a reboot** — that is the
+  handshake never converging (the log shows repeated `cybervfd: connected on …`),
+  or the frame stream stalling (`sensors: … ms since the last delivered sample`).
 - **Panel dark, but connected** — check Panel power and Backlight; brightness at
   0% is also dark.
 - **Panel blanks after ~5 s** — no data frames are arriving. That is the firmware

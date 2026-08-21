@@ -264,9 +264,20 @@ internal static class WindowEffects
     /// uses for windows on other virtual desktops, and it is the only way to let a
     /// window compose a complete frame at a position the user must not see it in.
     /// </summary>
-    public static void SetCloaked(Window window, bool cloaked)
+    public static void SetCloaked(Window window, bool cloaked) =>
+        SetCloaked(new WindowInteropHelper(window).Handle, cloaked);
+
+    /// <summary>
+    /// As above, for a handle the caller has already cached.
+    ///
+    /// This overload exists so a window can be uncloaked from a thread that is not
+    /// the UI thread: <c>WindowInteropHelper</c> touches the <see cref="Window"/>,
+    /// which has thread affinity, whereas an HWND and a DWM attribute write do not.
+    /// That is what lets the reveal watchdog get the panel on screen even when the
+    /// dispatcher is the thing that is stuck — see PanelWindow.OnRevealWatchdog.
+    /// </summary>
+    public static void SetCloaked(nint hwnd, bool cloaked)
     {
-        nint hwnd = new WindowInteropHelper(window).Handle;
         if (hwnd == nint.Zero) return;
         int value = cloaked ? 1 : 0;
         DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, ref value, sizeof(int));
@@ -304,9 +315,73 @@ internal static class WindowEffects
         catch (EntryPointNotFoundException) { return 0; }
     }
 
+    /// <summary>
+    /// The scale the OS says the window's own monitor has — the same question
+    /// <see cref="GetDpiScale(Window)"/> answers, asked of Windows instead of of WPF.
+    ///
+    /// The two must agree, and when they do not, WPF is the one that is wrong: its
+    /// value is a cache refreshed only by WM_DPICHANGED, and a window that was hidden
+    /// when the display configuration changed never receives one. Everything the panel
+    /// computes — its width in pixels, its height budget, where its edges land — is a
+    /// conversion between WPF's units and the monitor's, so a stale cache does not
+    /// degrade the layout, it scales the whole window by the ratio of the two.
+    /// Comparing them is the only way to catch that before it reaches the screen.
+    /// </summary>
+    public static double GetDpiScaleForWindow(nint hwnd)
+    {
+        if (hwnd == nint.Zero) return 0;
+        // Windows 10 1607 and later. On anything older there is no per-monitor DPI to
+        // go stale in the first place, so a failure here is safely "no disagreement".
+        try
+        {
+            uint dpi = GetDpiForWindow(hwnd);
+            return dpi == 0 ? 0 : dpi / 96.0;
+        }
+        catch (DllNotFoundException) { return 0; }
+        catch (EntryPointNotFoundException) { return 0; }
+    }
+
+    /// <summary>
+    /// Every monitor's bounds, work area and scale on one line, for the log entry
+    /// written when the display configuration changes. A panel that comes back the
+    /// wrong size after a resolution change is a report that cannot be acted on
+    /// without knowing what the display layout actually became.
+    /// </summary>
+    public static string DescribeMonitors()
+    {
+        var parts = new List<string>();
+        try
+        {
+            bool Callback(nint monitor, nint hdc, ref RECT rect, nint data)
+            {
+                var info = new MONITORINFO { cbSize = Marshal.SizeOf<MONITORINFO>() };
+                if (!GetMonitorInfo(monitor, ref info)) return true;
+                double scale = 0;
+                try
+                {
+                    if (GetDpiForMonitor(monitor, MDT_EFFECTIVE_DPI, out uint dpiX, out _) == 0)
+                        scale = dpiX / 96.0;
+                }
+                catch (DllNotFoundException) { }
+                catch (EntryPointNotFoundException) { }
+
+                RECT m = info.rcMonitor, w = info.rcWork;
+                parts.Add(
+                    $"[{m.left},{m.top} {m.right - m.left}x{m.bottom - m.top} " +
+                    $"work {w.right - w.left}x{w.bottom - w.top} @{scale:F2}" +
+                    $"{((info.dwFlags & MONITORINFOF_PRIMARY) != 0 ? " primary" : "")}]");
+                return true;
+            }
+            EnumDisplayMonitors(nint.Zero, nint.Zero, Callback, nint.Zero);
+        }
+        catch (Exception ex) { return $"unavailable ({ex.Message})"; }
+        return parts.Count == 0 ? "none" : string.Join(" ", parts);
+    }
+
     // ---------------------------------------------------------------- interop
 
     private const int MONITOR_DEFAULTTONEAREST = 2;
+    private const int MONITORINFOF_PRIMARY = 1;
     private const int MDT_EFFECTIVE_DPI = 0;
 
     private const int SWP_NOSIZE = 0x0001;
@@ -354,6 +429,14 @@ internal static class WindowEffects
 
     [DllImport("shcore.dll")]
     private static extern int GetDpiForMonitor(nint monitor, int type, out uint dpiX, out uint dpiY);
+
+    [DllImport("user32.dll")]
+    private static extern uint GetDpiForWindow(nint hwnd);
+
+    private delegate bool MonitorEnumProc(nint monitor, nint hdc, ref RECT rect, nint data);
+
+    [DllImport("user32.dll")]
+    private static extern bool EnumDisplayMonitors(nint hdc, nint clip, MonitorEnumProc callback, nint data);
 
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT point);

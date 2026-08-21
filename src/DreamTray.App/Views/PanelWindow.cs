@@ -102,6 +102,32 @@ internal sealed class PanelWindow : Window
     // Pending "compose at rest, then jump off-screen and slide in" step. See BeginReveal.
     private EventHandler? _reveal;
     private int _revealFrames;
+    // Whether the pending reveal ends in a slide (animation on) or a bare uncloak.
+    private bool _revealSlides;
+    // Backstop for a reveal whose frame callback never arrives. See ArmRevealWatchdog.
+    private System.Threading.Timer? _revealWatchdog;
+    private int _watchdogTicks;
+    // Set when the watchdog put the window on screen without the UI thread. The panel
+    // is already visible where it stands, so the reveal must not go on to throw it
+    // off-screen and slide it back — that would read as the panel appearing, vanishing
+    // and then arriving.
+    private volatile bool _revealForced;
+
+    // The window handle, cached the moment it exists. Everything that reads it off the
+    // UI thread has to come from here: WindowInteropHelper touches the Window, which
+    // has thread affinity, and the watchdog runs on the thread pool precisely because
+    // it cannot assume the UI thread is alive to run on.
+    private nint _hwnd;
+    // Whether the window is currently hidden from the screen by DWM. Written from the
+    // watchdog thread as well as the UI thread.
+    private volatile bool _cloaked;
+
+    // Open profiling. One clock runs from the tray click to the panel actually being
+    // on screen — which is *after* ShowNear returns, because the reveal is asynchronous
+    // — so the trace has to outlive the call that starts it.
+    private readonly System.Diagnostics.Stopwatch _openClock = new();
+    private System.Text.StringBuilder? _openTrace;
+    private double _lastTraceMark;
 
     // Theme and backdrop the window chrome was last built for. Null until the first
     // pass, so that one always runs. See ApplyWindowEffects.
@@ -453,27 +479,74 @@ internal sealed class PanelWindow : Window
     // ---------------------------------------------------------------- show / hide
 
     /// <summary>
-    /// Where the time went in the last <see cref="ShowNear"/>, for the log line the
-    /// tray controller writes when an open was slow enough to notice. Every phase
-    /// here runs on the UI thread between the click and the flyout appearing, so a
-    /// number that stands out names the culprit directly rather than leaving the
-    /// next person to guess which widget went to the hardware.
+    /// Where the time went in the last open, kept for <c>--selftest</c>. The same
+    /// string is written to the log on every open by <see cref="FinishOpenTrace"/>.
     /// </summary>
     internal string LastOpenTrace { get; private set; } = "";
 
-    /// <summary>Position next to the tray icon and show.</summary>
-    public void ShowNear(Rect iconRect)
+    /// <summary>
+    /// Start the trace for one open. <paramref name="callerTrace"/> is whatever the
+    /// tray controller already spent before handing over — building the window,
+    /// asking the shell for the icon rectangle — so the log line accounts for the
+    /// whole trip from the click rather than starting halfway through it.
+    /// </summary>
+    private void BeginOpenTrace(string callerTrace)
     {
-        var clock = System.Diagnostics.Stopwatch.StartNew();
-        var trace = new System.Text.StringBuilder();
-        double last = 0;
-        void Mark(string phase)
-        {
-            double now = clock.Elapsed.TotalMilliseconds;
-            if (trace.Length > 0) trace.Append(", ");
-            trace.Append($"{phase} {now - last:F0}");
-            last = now;
-        }
+        _openTrace = new System.Text.StringBuilder(callerTrace);
+        _lastTraceMark = 0;
+        _openClock.Restart();
+    }
+
+    /// <summary>Record how long the phase that just finished took, in milliseconds.</summary>
+    private void MarkOpen(string phase)
+    {
+        if (_openTrace is null) return;
+        double now = _openClock.Elapsed.TotalMilliseconds;
+        if (_openTrace.Length > 0) _openTrace.Append(", ");
+        _openTrace.Append($"{phase} {now - _lastTraceMark:F0}");
+        _lastTraceMark = now;
+    }
+
+    /// <summary>
+    /// Close the trace and write it, once the panel is genuinely on screen.
+    ///
+    /// Deliberately unconditional rather than logged only past some threshold: the
+    /// open path is user-initiated and runs a handful of times an hour, so the volume
+    /// is nothing, and a report of "it was slow that one time" is only actionable if
+    /// the fast opens around it were recorded too. The total is what the user
+    /// experiences as the delay; the phases say which part of it to go and look at.
+    /// </summary>
+    private void FinishOpenTrace()
+    {
+        if (_openTrace is null) return;
+        double total = _openClock.Elapsed.TotalMilliseconds;
+        LastOpenTrace = _openTrace.ToString();
+        _openTrace = null;
+        _openClock.Stop();
+        Logging.Log.Write($"panel open {total:F0} ms total: {LastOpenTrace}");
+    }
+
+    /// <summary>
+    /// The panel was dismissed before it ever reached the screen. This gets its own
+    /// line because it is the exact shape of an "it did not open at all" report: the
+    /// trace says which phase the open had got to, and the total says how long the
+    /// window sat there cloaked — invisible, but active, and answering the next click
+    /// as though it had been open the whole time.
+    /// </summary>
+    private void AbortOpenTrace(string why)
+    {
+        if (_openTrace is null) return;
+        double total = _openClock.Elapsed.TotalMilliseconds;
+        string trace = _openTrace.ToString();
+        _openTrace = null;
+        _openClock.Stop();
+        Logging.Log.Write($"panel open abandoned after {total:F0} ms ({why}): {trace}");
+    }
+
+    /// <summary>Position next to the tray icon and show.</summary>
+    public void ShowNear(Rect iconRect, string callerTrace = "")
+    {
+        BeginOpenTrace(callerTrace);
 
         // Cancel a close that is still playing, otherwise its Completed handler
         // would hide the panel we are in the middle of reopening.
@@ -482,7 +555,7 @@ internal sealed class PanelWindow : Window
         // the window is constructed at startup but only gets a handle when it is
         // shown. Without this the first open of the session is the one that shows
         // its own assembly, which is exactly the case that is slowest.
-        new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
+        _hwnd = new System.Windows.Interop.WindowInteropHelper(this).EnsureHandle();
         // Cloak before showing, and lay the panel out at its *resting* position: a
         // window only ever paints the part of itself that is on screen, so one that
         // is shown off-screen and then slid in arrives with everything below the
@@ -506,24 +579,35 @@ internal sealed class PanelWindow : Window
         // from the monitor it lands on.
         SetAnchor(iconRect);
         ApplyHeightBudget();
-        WindowEffects.SetCloaked(this, true);
+        Cloak(true);
         Show();
-        Mark("show");
+        MarkOpen("show");
+        // Get the window onto the monitor it is going to open on before a single
+        // thing is measured. It is shown at wherever it was last left — on the first
+        // open of the session, the parking spot far off-screen — and if that monitor
+        // scales differently from the destination, then laying out here means laying
+        // out at the wrong scale: WPF only learns the new one from the WM_DPICHANGED
+        // that arrives *during* the move, by which point the height budget and the
+        // layout have both already been computed against the old figure. Positioning
+        // first costs one extra SetWindowPos on a cloaked window and makes every
+        // measurement below happen in the units the panel will actually be shown in.
+        ApplyPosition();
+        MarkOpen("park");
         // Re-check the backdrop on every open: the user can switch transparency
         // effects on or off while the panel is alive, and the window is created
         // once and reused, so SourceInitialized alone would never see the change.
         ApplyWindowEffects();
-        Mark("effects");
-        // Once the window exists the scale can be read from it as well, so the budget
-        // is worked out again now that both answers are available.
+        MarkOpen("effects");
+        // Now that the window is on the right monitor its scale is settled, so the
+        // budget is worked out again against the figure that will actually apply.
         ApplyHeightBudget();
         // Height is content-driven, so lay out before positioning — otherwise that
         // runs on a stale (zero) height and the panel lands off the bottom.
         UpdateLayout();
-        Mark("layout");
+        MarkOpen("layout");
         ApplyPosition();
         Activate();
-        Mark("activate");
+        MarkOpen("activate");
         // Every widget's OnShown runs from here, and with it every sensor
         // subscription. The slow hardware reads are already off the UI thread, but
         // their *results* are not: each one comes back to rebuild its card, which
@@ -534,23 +618,22 @@ internal sealed class PanelWindow : Window
         // when its card is built.
         if (animate)
         {
-            BeginReveal();
+            BeginReveal(slide: true);
         }
         else
         {
             // Nothing is in flight to be disturbed here, so the widgets are woken
             // while the window is still cloaked and the panel is re-laid-out and
             // re-anchored around whatever their cached readings changed. Then one
-            // composed frame is waited for, exactly as BeginReveal does, so the
+            // composed frame is waited for, exactly as the animated path does, so the
             // panel becomes visible already complete rather than as an empty
             // rectangle that fills in afterwards.
             _manager.SetPanelVisible(true);
-            Mark("widgets");
+            MarkOpen("widgets");
             UpdateLayout();
             ApplyPosition();
-            BeginUncloak();
+            BeginReveal(slide: false);
         }
-        LastOpenTrace = trace.ToString();
         LogGeometry("open");
     }
 
@@ -572,6 +655,7 @@ internal sealed class PanelWindow : Window
         // true and a second dismissal (a tray click landing on top of the Deactivated
         // that started this one) would restart the animation from full opacity.
         if (!IsVisible || _closing) return;
+        AbortOpenTrace(_cloaked ? "still cloaked" : "revealed but not yet traced");
         foreach (var host in _list.Children.OfType<WidgetHost>()) host.CloseSettings();
         if (_addPopup != null) _addPopup.IsOpen = false;
 
@@ -593,61 +677,148 @@ internal sealed class PanelWindow : Window
     /// behind the taskbar. No fade — the shell does not fade these, and the taskbar
     /// hiding the first part of the trip is what sells it.
     /// </summary>
+    // How long the reveal is allowed to wait for the frame callback before giving up
+    // on it, and how long after that before the window is uncloaked without the UI
+    // thread's help at all. Both are far longer than the two frames being waited for
+    // (about 30 ms at 60 Hz) and far shorter than a delay a user would call a delay.
+    private const int RevealSoftDeadlineMs = 250;
+    private const int RevealHardDeadlineMs = 500;
+
     /// <summary>
     /// Wait for the cloaked panel to compose one complete frame at its resting
-    /// position, then throw it off-screen, uncloak, and slide it back in.
+    /// position, then — if <paramref name="slide"/> — throw it off-screen, uncloak,
+    /// and slide it back in; otherwise just uncloak it where it stands.
     ///
     /// Two ticks, not one: CompositionTarget.Rendering fires *before* the frame it
     /// belongs to is drawn, so the first one is still ahead of the paint being waited
     /// on. The second means a full frame with the panel at rest has been composed.
     /// That costs about 30 ms between the click and the panel moving, which is well
     /// under what reads as a delay.
+    ///
+    /// The watchdog is not an optimisation, it is the correctness of this whole
+    /// mechanism. Waiting on a frame callback makes the panel's visibility depend on
+    /// the render loop continuing to tick, and that is not something this code gets to
+    /// assume: the window is cloaked, so DWM has no reason to present it; the UI
+    /// thread is at that moment running the widgets' wake-up; and on a loaded machine
+    /// the render-priority dispatcher work behind CompositionTarget.Rendering is
+    /// exactly what gets starved first. Miss the callback and the window sits there
+    /// cloaked — invisible, but active, visible-to-WPF, and dismissed by the next
+    /// click as though it had been open all along. That is the "opened four seconds
+    /// late", and the "did not open at all", and they are the same bug: an unbounded
+    /// wait on something nobody guarantees will happen.
     /// </summary>
-    private void BeginReveal()
+    private void BeginReveal(bool slide)
     {
         CancelReveal();
+        _revealSlides = slide;
+        _revealForced = false;
         _revealFrames = 0;
         _reveal = (_, _) =>
         {
             if (++_revealFrames < 2) return;
-            CancelReveal();
-            // Last chance to catch a region that does not match the window it is on:
-            // after this the panel is on screen, and a short one takes the bottom of
-            // the list with it.
-            UpdateCornerRadius();
-            WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
-            WindowEffects.SetCloaked(this, false);
-            AnimateOpen();
+            CompleteReveal("frames");
         };
         CompositionTarget.Rendering += _reveal;
+        ArmRevealWatchdog();
     }
 
     /// <summary>
-    /// The no-animation reveal: wait for one complete composed frame, then uncloak.
-    /// Same two-tick reasoning as <see cref="BeginReveal"/> — Rendering fires ahead
-    /// of the frame it belongs to, so the second tick is the first moment a frame
-    /// with the finished panel in it exists.
+    /// Put the panel on screen. Runs on the UI thread, from whichever of the frame
+    /// callback and the watchdog gets there first; the second one finds the reveal
+    /// already cancelled and does nothing.
     /// </summary>
-    private void BeginUncloak()
+    private void CompleteReveal(string cause)
     {
+        if (_reveal is null) return;
         CancelReveal();
-        _revealFrames = 0;
-        _reveal = (_, _) =>
+
+        // Last chance to catch a region that does not match the window it is on:
+        // after this the panel is on screen, and a short one takes the bottom of
+        // the list with it.
+        UpdateCornerRadius();
+        if (_revealSlides && !_revealForced)
         {
-            if (++_revealFrames < 2) return;
-            CancelReveal();
-            // As in BeginReveal: the region is checked against the window one last
-            // time before the panel is allowed on screen.
-            UpdateCornerRadius();
-            WindowEffects.SetCloaked(this, false);
-        };
-        CompositionTarget.Rendering += _reveal;
+            WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
+            Cloak(false);
+            AnimateOpen();
+        }
+        else
+        {
+            Cloak(false);
+        }
+
+        MarkOpen($"reveal({cause},{_revealFrames}f)");
+        FinishOpenTrace();
+    }
+
+    /// <summary>
+    /// Arm the two deadlines that guarantee the panel becomes visible.
+    ///
+    /// The first fires on the UI thread and simply finishes the reveal without its
+    /// frame — the panel may be a few milliseconds short of a complete composition,
+    /// which nobody will see, and it is on screen.
+    ///
+    /// The second does not go near the UI thread, because by then the UI thread is
+    /// the suspect: if the dispatcher were running, the first deadline would have
+    /// been served. Uncloaking is a DWM attribute write against a cached HWND, which
+    /// needs neither the dispatcher nor thread affinity, so the window can be put on
+    /// screen from the pool thread regardless of what the app is doing. A panel that
+    /// is a frame behind beats a panel that never appears.
+    /// </summary>
+    private void ArmRevealWatchdog()
+    {
+        DisarmRevealWatchdog();
+        _watchdogTicks = 0;
+        _revealWatchdog = new System.Threading.Timer(
+            OnRevealWatchdog, null, RevealSoftDeadlineMs, RevealHardDeadlineMs);
+    }
+
+    private void OnRevealWatchdog(object? state)
+    {
+        if (Interlocked.Increment(ref _watchdogTicks) == 1)
+        {
+            Dispatcher.BeginInvoke(
+                System.Windows.Threading.DispatcherPriority.Send,
+                new Action(() => CompleteReveal("watchdog")));
+            return;
+        }
+
+        // Still hidden one whole deadline after asking the UI thread to finish. It is
+        // not coming; uncloak from here and say so, because this line is the evidence
+        // that the stall was the dispatcher rather than anything the panel did.
+        DisarmRevealWatchdog();
+        if (!_cloaked) return;
+        _revealForced = true;
+        _cloaked = false;
+        WindowEffects.SetCloaked(_hwnd, false);
+        Logging.Log.Write(
+            $"panel reveal: no composed frame and no dispatcher within " +
+            $"{RevealSoftDeadlineMs + RevealHardDeadlineMs} ms — uncloaked off-thread");
+    }
+
+    private void DisarmRevealWatchdog()
+    {
+        var timer = Interlocked.Exchange(ref _revealWatchdog, null);
+        timer?.Dispose();
     }
 
     private void CancelReveal()
     {
+        DisarmRevealWatchdog();
         if (_reveal != null) CompositionTarget.Rendering -= _reveal;
         _reveal = null;
+    }
+
+    /// <summary>
+    /// Hide or reveal the window through DWM, keeping <see cref="_cloaked"/> in step.
+    /// Everything goes through here so the watchdog can tell whether the panel is
+    /// still hidden without racing the UI thread over it.
+    /// </summary>
+    private void Cloak(bool cloaked)
+    {
+        if (_hwnd == nint.Zero) _hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
+        _cloaked = cloaked;
+        WindowEffects.SetCloaked(_hwnd, cloaked);
     }
 
     private void AnimateOpen()
@@ -675,7 +846,7 @@ internal sealed class PanelWindow : Window
         // A dismissal landing inside the reveal window finds the panel still cloaked
         // at its resting position, which is exactly where the exit starts from.
         CancelReveal();
-        WindowEffects.SetCloaked(this, false);
+        Cloak(false);
         _closing = true;
         StartSlide(_restTopPx, _offscreenTopPx, CloseSlideTime, CloseEase, () =>
         {
@@ -775,7 +946,7 @@ internal sealed class PanelWindow : Window
         _closing = false;
         // Never leave the window cloaked: it would be invisible but still active, and
         // the next dismissal would hide an already-invisible panel.
-        WindowEffects.SetCloaked(this, false);
+        Cloak(false);
     }
 
     private void SetAnchor(Rect iconRect)
@@ -847,13 +1018,50 @@ internal sealed class PanelWindow : Window
         WindowEffects.TryGetSize(this, out int wPx, out int hPx);
         Rect work = WindowEffects.GetWorkArea(_anchor);
         Rect region = WindowEffects.GetRegionBox(this);
+        double wpfScale = WindowEffects.GetDpiScale(this);
+        double osScale = WindowEffects.GetDpiScaleForWindow(_hwnd);
         Logging.Log.Write(
             $"panel {phase}: win {ActualWidth:F0}x{ActualHeight:F0} dip, hwnd {wPx}x{hPx} px, " +
             $"region {(region.IsEmpty ? "none" : $"{region.Width:F0}x{region.Height:F0}")}, " +
-            $"max {MaxHeight:F0} dip, scale win {WindowEffects.GetDpiScale(this):F2} " +
+            $"max {MaxHeight:F0} dip, scale wpf {wpfScale:F2} os {osScale:F2} " +
             $"mon {WindowEffects.GetDpiScale(_anchor):F2}, work {work.Width:F0}x{work.Height:F0} px, " +
             $"list viewport {_scroller.ViewportHeight:F0} extent {_scroller.ExtentHeight:F0}, " +
             $"sizeToContent {SizeToContent}, top {Top:F0}");
+    }
+
+    /// <summary>
+    /// Whether WPF's cached scale for this window has fallen out of step with the
+    /// monitor it is actually on. When it has, every dimension the panel derives is
+    /// off by the ratio between the two — most visibly the width, which is a fixed
+    /// <see cref="PanelWidth"/> in WPF's units and therefore becomes
+    /// <c>340 x wpfScale</c> physical pixels on a monitor that wanted
+    /// <c>340 x osScale</c> of them. A panel that comes back conspicuously narrow
+    /// after a few resolution changes is this, and nothing else: nothing in the
+    /// layout can make the window narrower, because nothing constrains its width.
+    ///
+    /// WPF refreshes that cache from WM_DPICHANGED alone, and Windows does not send
+    /// WM_DPICHANGED to a window that is hidden — which this one is, all but a few
+    /// seconds of its life, because it is created once at startup and hidden rather
+    /// than closed. So a display change that lands while the panel is closed is
+    /// invisible to it, permanently. There is no supported way to correct the cache
+    /// in place; the window has to be built again. See TrayController.ShowPanel.
+    /// </summary>
+    /// <summary>
+    /// Whether the window has been realised yet. A panel that has only ever been
+    /// prewarmed holds no cached scale — it has not been near a monitor — so there is
+    /// nothing for a display change to invalidate.
+    /// </summary>
+    internal bool HasWindowHandle => _hwnd != nint.Zero;
+
+    internal bool IsDpiStale()
+    {
+        if (_hwnd == nint.Zero) return false;
+        double wpf = WindowEffects.GetDpiScale(this);
+        double os = WindowEffects.GetDpiScaleForWindow(_hwnd);
+        // A zero from either side means the answer is unavailable, not that they
+        // disagree — an old build with no GetDpiForWindow must not rebuild every open.
+        if (wpf <= 0 || os <= 0) return false;
+        return Math.Abs(wpf - os) > 0.001;
     }
 
     /// <summary>
@@ -893,6 +1101,7 @@ internal sealed class PanelWindow : Window
 
     private void OnSourceInitialized(object? sender, EventArgs e)
     {
+        _hwnd = new System.Windows.Interop.WindowInteropHelper(this).Handle;
         if (PresentationSource.FromVisual(this) is System.Windows.Interop.HwndSource source)
             source.AddHook(OnWindowMessage);
         ApplyWindowEffects();
@@ -1074,9 +1283,12 @@ internal sealed class PanelWindow : Window
     protected override void OnClosed(EventArgs e)
     {
         // CompositionTarget.Rendering is static, so a slide or a pending reveal left
-        // running here would keep the closed window alive and moving.
+        // running here would keep the closed window alive and moving. CancelReveal
+        // also disposes the watchdog timer, which would otherwise fire against a
+        // handle that no longer exists.
         CancelReveal();
         StopSlide();
+        _hwnd = nint.Zero;
         _services.Theme.Changed -= OnThemeChanged;
         _manager.LayoutChanged -= RebuildList;
         _manager.Dispose();

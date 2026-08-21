@@ -22,7 +22,11 @@ public static class Log
     {
         lock (Gate)
         {
-            Pending.Append(DateTime.Now.ToString("HH:mm:ss")).Append("  ").AppendLine(message);
+            // Milliseconds, not seconds: the things worth diagnosing here — how long a
+            // flyout took to appear, which phase of an open ate the time — all happen
+            // well inside one second, and a second-resolution stamp collapses them
+            // into a single indistinguishable line.
+            Pending.Append(DateTime.Now.ToString("HH:mm:ss.fff")).Append("  ").AppendLine(message);
             if (Pending.Length > 8192) FlushLocked();
         }
     }

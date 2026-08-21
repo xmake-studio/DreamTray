@@ -34,6 +34,55 @@ internal sealed class TrayController : IDisposable
         _services.Theme.TrayThemeChanged += () => _icon?.SetLight(_services.Theme.TrayUsesDark);
 
         _services.NotificationSink = (title, message) => _icon?.ShowBalloon(title, message);
+
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+        Logging.Log.Write($"displays at startup: {WindowEffects.DescribeMonitors()}");
+    }
+
+    // ---------------------------------------------------------------- display changes
+
+    /// <summary>
+    /// Throw the panel away and build a fresh one whenever the display configuration
+    /// changes.
+    ///
+    /// The panel is created once and hidden rather than closed, which is what makes
+    /// opening it instant — and which is also why it cannot survive this. WPF caches
+    /// the monitor scale per window and refreshes it only from WM_DPICHANGED, and
+    /// Windows does not send WM_DPICHANGED to hidden windows. A resolution change made
+    /// while the panel is closed therefore leaves the window permanently convinced of
+    /// the old scale, and every dimension it computes scaled by the ratio of the two.
+    /// There is no API for correcting that cache; a new window is the fix, and it is
+    /// cheap here because it happens at idle rather than under a click.
+    ///
+    /// Raised on a system thread, so everything real happens back on the dispatcher.
+    /// </summary>
+    private void OnDisplaySettingsChanged(object? sender, EventArgs e) =>
+        Application.Current?.Dispatcher.BeginInvoke(
+            System.Windows.Threading.DispatcherPriority.Background,
+            new Action(() =>
+            {
+                Logging.Log.Write($"display settings changed: {WindowEffects.DescribeMonitors()}");
+                RebuildPanel("display change");
+            }));
+
+    /// <summary>
+    /// Replace the panel window, unless it is on screen — yanking a flyout out from
+    /// under the user is worse than the stale scale it would be fixing, and the check
+    /// in <see cref="ShowPanel"/> catches whatever this skips on the next open anyway.
+    /// </summary>
+    private void RebuildPanel(string reason)
+    {
+        if (_panel == null || !_panel.HasWindowHandle) return;
+        if (_panel.IsVisible)
+        {
+            Logging.Log.Write($"panel rebuild deferred ({reason}): panel is on screen");
+            return;
+        }
+
+        Logging.Log.Write($"panel rebuilt ({reason})");
+        _panel.Close();
+        _panel = null;
+        Prewarm();
     }
 
     // ---------------------------------------------------------------- panel
@@ -75,6 +124,20 @@ internal sealed class TrayController : IDisposable
     public void ShowPanel()
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // Last line of defence for the scale cache. DisplaySettingsChanged catches
+        // almost every case, but it does not fire for a monitor swapped on the KVM,
+        // a dock attached while asleep, or a scale change applied to a window that
+        // happened to be visible at the time — and any one of those leaves a panel
+        // that opens at the wrong size. Asking the window whether it still agrees with
+        // its own monitor costs one call and cannot be fooled by whichever
+        // notification went missing.
+        if (_panel != null && _panel.IsDpiStale())
+        {
+            Logging.Log.Write("panel scale disagrees with its monitor — rebuilding before open");
+            RebuildPanel("stale dpi");
+        }
+
         bool built = false;
         if (_panel == null)
         {
@@ -86,23 +149,20 @@ internal sealed class TrayController : IDisposable
         }
         long afterBuild = clock.ElapsedMilliseconds;
 
-        // A cross-process call into explorer's tray. It is not ours to make faster,
-        // so it is measured separately rather than folded into the panel's own time.
+        // A cross-process call into explorer's tray, and a blocking one: if explorer
+        // is busy — which on a loaded machine it is — this waits for it on the UI
+        // thread, between the click and anything at all happening. It is not ours to
+        // make faster, so it is measured on its own rather than folded into the
+        // panel's time, and it is the first number to look at in a slow open.
         var iconRect = _icon?.GetIconRect() ?? Rect.Empty;
         long afterRect = clock.ElapsedMilliseconds;
 
-        _panel.ShowNear(iconRect);
-        // Everything above runs on the UI thread between the click and the panel
-        // being composed, so anything slow in a widget's OnShown shows up here as a
-        // late flyout. Logged only when it is long enough for a user to notice, with
-        // the per-phase split so a slow one names itself.
-        if (clock.ElapsedMilliseconds >= 100)
-        {
-            Logging.Log.Write(
-                $"panel open took {clock.ElapsedMilliseconds} ms on the UI thread " +
-                $"(build {afterBuild}{(built ? "" : " cached")}, icon rect {afterRect - afterBuild}, " +
-                $"{_panel.LastOpenTrace})");
-        }
+        // The panel finishes the trace and writes it, because the open is not over
+        // when this call returns: the window is still cloaked at that point and only
+        // becomes visible a frame or two later.
+        _panel.ShowNear(
+            iconRect,
+            $"build {afterBuild}{(built ? "" : " cached")}, iconrect {afterRect - afterBuild}");
     }
 
     /// <summary>
@@ -191,6 +251,7 @@ internal sealed class TrayController : IDisposable
 
     public void Dispose()
     {
+        Microsoft.Win32.SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         _panel?.Close();
         _settings?.Close();
         _icon?.Dispose();
