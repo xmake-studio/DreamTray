@@ -6,6 +6,12 @@ rem resulting exe asks for them itself when it runs.
 rem
 rem Framework-dependent: needs the .NET 8 Desktop Runtime on the target machine,
 rem which keeps the output ~2 MB instead of ~150 MB self-contained.
+rem
+rem ReadyToRun: the first panel open is the one that JITs the WPF XAML parser, the
+rem theme dictionaries and every widget's construction path, and that cost lands on
+rem whichever click gets there before the idle prewarm does. Precompiling moves it
+rem to build time, for a few MB of output. It needs the -r below; a RID-less
+rem publish accepts the flag and silently does nothing with it.
 rem ---------------------------------------------------------------------------
 
 cd /d "%~dp0"
@@ -14,6 +20,7 @@ echo Building DreamTray (Release, x64)...
 dotnet publish src\DreamTray.App\DreamTray.App.csproj ^
     -c Release -r win-x64 --self-contained false ^
     -p:PublishSingleFile=false ^
+    -p:PublishReadyToRun=true ^
     -o dist
 if errorlevel 1 goto :failed
 

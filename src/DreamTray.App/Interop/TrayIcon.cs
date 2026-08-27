@@ -24,7 +24,17 @@ internal sealed class TrayIcon : IDisposable
     private const int WM_LBUTTONUP = 0x0202;
     private const int WM_LBUTTONDBLCLK = 0x0203;
     private const int WM_RBUTTONUP = 0x0205;
+    private const int WM_MOUSEMOVE = 0x0200;
     private const int WM_DPICHANGED = 0x02E0;
+    /// <summary>Version-4 notification that the shell is opening the icon's tooltip.</summary>
+    private const int NIN_POPUPOPEN = 0x0406;
+
+    /// <summary>
+    /// How stale a cached icon rectangle may get while the pointer is sitting on the
+    /// icon. Short enough that a taskbar rearranging under the cursor is caught,
+    /// long enough that a hover does not mean one cross-process call per mouse move.
+    /// </summary>
+    private const int RectCacheRefreshMs = 200;
 
     private readonly uint _taskbarCreatedMessage;
     private readonly Guid _iconId = new("6f6a2f7a-2b1e-4b28-9f1a-2b0d4c8e1a11");
@@ -35,6 +45,26 @@ internal sealed class TrayIcon : IDisposable
     private bool _light;
     /// <summary>Set between a press already acted on and the release that ends it.</summary>
     private bool _pressHandled;
+
+    /// <summary>
+    /// Last rectangle the shell gave us, and when. See <see cref="CachedIconRect"/>.
+    ///
+    /// One immutable object rather than a Rect and a timestamp side by side, because
+    /// it is written from the thread pool and read from the UI thread: a reference
+    /// swap is atomic, whereas a 32-byte Rect assignment can be read half-updated,
+    /// and half of one rectangle and half of another is a panel anchored nowhere.
+    /// </summary>
+    private sealed record IconRect(Rect Bounds, long AtTicks);
+
+    private volatile IconRect _cached = new(Rect.Empty, 0);
+
+    /// <summary>
+    /// When a hover last queued a refresh. UI-thread only, and deliberately separate
+    /// from <see cref="_cached"/>: throttling off the cached record would mean
+    /// reading it, editing it and writing it back, and a background answer landing
+    /// inside that would be overwritten with the stale rectangle it just replaced.
+    /// </summary>
+    private long _refreshQueuedAtTicks;
 
     /// <summary>
     /// Left click (or Enter/Space on the keyboard-focused icon). Raised on the button
@@ -126,6 +156,8 @@ internal sealed class TrayIcon : IDisposable
         // Version 4 gives us proper mouse messages with screen coordinates in wParam.
         Shell_NotifyIcon(NIM_SETVERSION, ref data);
         _added = true;
+        // Seed the cache now, so the very first click has a rectangle to use.
+        RefreshIconRectInBackground();
     }
 
     private void Modify()
@@ -160,8 +192,75 @@ internal sealed class TrayIcon : IDisposable
             hWnd = _source.Handle,
             uID = 1,
         };
-        if (Shell_NotifyIconGetRect(ref id, out RECT r) != 0) return Rect.Empty;
-        return new Rect(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        if (Shell_NotifyIconGetRect(ref id, out RECT r) != 0)
+        {
+            // The icon is in the overflow flyout, or the shell is not answering.
+            // Either way we no longer know where it is, and a remembered rectangle
+            // from before it was collapsed would anchor the panel to empty taskbar.
+            _cached = new IconRect(Rect.Empty, Environment.TickCount64);
+            return Rect.Empty;
+        }
+
+        var bounds = new Rect(r.left, r.top, r.right - r.left, r.bottom - r.top);
+        _cached = new IconRect(bounds, Environment.TickCount64);
+        return bounds;
+    }
+
+    /// <summary>
+    /// The icon's rectangle as of the last time the shell was asked, without asking
+    /// it again. Empty when it has never answered, or answered that the icon is
+    /// hidden.
+    ///
+    /// <see cref="GetIconRect"/> is a cross-process call into Explorer, and a
+    /// blocking one. On the path between a click and the panel appearing that is the
+    /// single worst thing in this app: on a machine under load — which is exactly
+    /// when someone opens a power panel — Explorer can take a long time to answer,
+    /// and until it does nothing at all has happened on screen.
+    ///
+    /// So it is asked at the moments nobody is waiting: when the icon is registered,
+    /// when the taskbar is rebuilt or its DPI changes, while the pointer hovers (a
+    /// tray click is preceded by mouse moves over the icon, which arrive here as
+    /// messages), and after each panel open completes. The click itself reads what
+    /// those left behind.
+    /// </summary>
+    public Rect CachedIconRect => _cached.Bounds;
+
+    /// <summary>
+    /// Bring the cache up to date from a hover, throttled, and off this thread.
+    ///
+    /// Off this thread matters more than it looks. Hovering is an idle moment, so
+    /// blocking here would usually be free — but "usually" is not the case being
+    /// designed for. The whole point of the cache is the machine where Explorer is
+    /// slow to answer, and doing it inline would mean that on exactly that machine
+    /// the UI thread is stuck inside the hover that precedes the click, so the click
+    /// waits anyway and nothing has been gained.
+    /// </summary>
+    private void RefreshRectThrottled()
+    {
+        // Claimed when the call is queued, not when it answers: two hovers a frame
+        // apart would otherwise both see a stale clock and both queue a call.
+        if (Environment.TickCount64 - _refreshQueuedAtTicks < RectCacheRefreshMs) return;
+        _refreshQueuedAtTicks = Environment.TickCount64;
+        RefreshIconRectInBackground();
+    }
+
+    /// <summary>
+    /// Ask the shell where the icon is, off the UI thread, and keep the answer.
+    /// Used after the panel is on screen: the rectangle is wanted for the *next*
+    /// open, so the wait belongs anywhere but here.
+    ///
+    /// Shell_NotifyIconGetRect takes an HWND but does not require the calling thread
+    /// to own it, and the answer lands in a single reference swap.
+    /// </summary>
+    public void RefreshIconRectInBackground()
+    {
+        if (_source == null) return;
+        System.Threading.ThreadPool.QueueUserWorkItem(static state =>
+        {
+            var icon = (TrayIcon)state!;
+            try { icon.GetIconRect(); }
+            catch { /* the shell not answering is the case this exists for */ }
+        }, this);
     }
 
     private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
@@ -173,11 +272,28 @@ internal sealed class TrayIcon : IDisposable
             Rebuild();
             handled = true;
         }
+        else if (msg == WM_DPICHANGED)
+        {
+            // Rebuild goes down the Modify path when the icon is still registered,
+            // which does not reseed the cache — but the taskbar has just been laid
+            // out again, so the remembered rectangle is exactly the stale one.
+            Rebuild();
+            RefreshIconRectInBackground();
+        }
         else if (msg == WM_TRAYCALLBACK)
         {
             int mouseMessage = (int)(lParam & 0xFFFF);
             switch (mouseMessage)
             {
+                // Nothing is waiting on these, and a tray click is always preceded by
+                // them. Refreshing here is what lets the click itself read a cached
+                // rectangle instead of blocking on Explorer for it.
+                case WM_MOUSEMOVE:
+                case NIN_POPUPOPEN:
+                    RefreshRectThrottled();
+                    handled = true;
+                    break;
+
                 case WM_LBUTTONDOWN:
                     _pressHandled = true;
                     Activated?.Invoke();
@@ -208,10 +324,6 @@ internal sealed class TrayIcon : IDisposable
                     handled = true;
                     break;
             }
-        }
-        else if (msg == WM_DPICHANGED)
-        {
-            Rebuild();
         }
         return nint.Zero;
     }

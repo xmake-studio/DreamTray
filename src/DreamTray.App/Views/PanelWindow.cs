@@ -664,6 +664,7 @@ internal sealed class PanelWindow : Window
             StopAnimations();
             _manager.SetPanelVisible(false);
             Hide();
+            MemoryTrim.Schedule(Logging.Log.Write);
             return;
         }
         AnimateClose();
@@ -854,6 +855,9 @@ internal sealed class PanelWindow : Window
             _manager.SetPanelVisible(false);
             Hide();
             SettleAt();
+            // Nothing is on screen from here until the next click, which is the only
+            // window this process gets for a blocking compacting collection.
+            MemoryTrim.Schedule(Logging.Log.Write);
         });
     }
 

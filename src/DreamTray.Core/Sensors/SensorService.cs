@@ -323,12 +323,39 @@ public sealed class SensorService : IDisposable
         _pagefile.Dispose();
     }
 
+    /// <summary>
+    /// Updates every hardware node, and drops the sample series LHM records behind
+    /// each sensor as it goes.
+    ///
+    /// That series exists so a monitoring UI can draw a graph without sampling for
+    /// itself. Nothing here draws graphs — <see cref="SensorService"/> reads
+    /// <c>ISensor.Value</c> once and throws the sample away. Left at its default the
+    /// series grows for the life of the process, across the hundred-odd sensors an
+    /// APU laptop with an iGPU exposes, at whatever rate the fastest subscriber
+    /// asked for. That is the app sitting in the tray all afternoon and ending up
+    /// a few hundred MB heavy, and it is retention rather than a leak: nothing ever
+    /// asked for the history back.
+    ///
+    /// <c>ISensor.Value</c> is a separate field from the series, so clearing it
+    /// costs nothing this class reads.
+    /// </summary>
     private sealed class UpdateVisitor : IVisitor
     {
         public void VisitComputer(IComputer c) => c.Traverse(this);
         public void VisitHardware(IHardware h)
         {
             h.Update();
+            foreach (var sen in h.Sensors)
+            {
+                // Both, deliberately. The window is what Sensor's own append path
+                // consults, and it has to be re-applied here rather than once at
+                // construction because sensors appear later than the Computer does —
+                // a GPU coming out of runtime suspend, a pack re-enumerated across an
+                // AC transition. ClearValues is the guarantee that does not depend on
+                // how that path chooses to read a zero window.
+                sen.ValuesTimeWindow = TimeSpan.Zero;
+                sen.ClearValues();
+            }
             foreach (var sub in h.SubHardware) sub.Accept(this);
         }
         public void VisitSensor(ISensor s) { }

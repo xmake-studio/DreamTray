@@ -249,13 +249,22 @@ internal static class WindowEffects
     /// which is fatal for a window travelling in from off-screen, because the parts
     /// still outside the monitor cannot be repainted and so end up undefined.
     /// Letting the bits move with the window is what keeps it whole.
+    ///
+    /// NOSENDCHANGING, on the other hand, is worth having. Every move otherwise
+    /// dispatches a WM_WINDOWPOSCHANGING through the window's WndProc and into WPF's
+    /// own handling of it before the move happens, on the UI thread, on the frame
+    /// callback, for each of the frames a slide is made of. Nothing here wants that
+    /// message: this app hooks WM_WINDOWPOSCHANGED (the past tense) for its region
+    /// check, and WPF's use of CHANGING is SizeToContent clamping, which StartSlide
+    /// has already pinned to Manual for the duration. The move itself is unaffected —
+    /// only the chance to veto or amend it, which nobody was taking.
     /// </summary>
     public static void MoveTo(Window window, int xPixels, int yPixels)
     {
         nint hwnd = new WindowInteropHelper(window).Handle;
         if (hwnd == nint.Zero) return;
         SetWindowPos(hwnd, nint.Zero, xPixels, yPixels, 0, 0,
-            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+            SWP_NOSIZE | SWP_NOZORDER | SWP_NOACTIVATE | SWP_NOOWNERZORDER | SWP_NOSENDCHANGING);
     }
 
     /// <summary>
@@ -388,6 +397,7 @@ internal static class WindowEffects
     private const int SWP_NOZORDER = 0x0004;
     private const int SWP_NOACTIVATE = 0x0010;
     private const int SWP_NOOWNERZORDER = 0x0200;
+    private const int SWP_NOSENDCHANGING = 0x0400;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MARGINS { public int Left, Right, Top, Bottom; }

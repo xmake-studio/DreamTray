@@ -112,7 +112,11 @@ internal sealed class TrayController : IDisposable
     private bool PointerOverIcon()
     {
         if ((GetAsyncKeyState(VK_LBUTTON) & 0x8000) == 0) return false;
-        var rect = _icon?.GetIconRect() ?? Rect.Empty;
+        // Cached: this runs while the panel is losing focus, which is the front half
+        // of the same click the controller is about to toggle on — the worst possible
+        // moment to block on Explorer. A hit test tolerates a rectangle a few hundred
+        // milliseconds old; the taskbar does not move under a pressed button.
+        var rect = _icon?.CachedIconRect ?? Rect.Empty;
         return !rect.IsEmpty && rect.Contains(WindowEffects.GetCursorPosition());
     }
 
@@ -124,6 +128,10 @@ internal sealed class TrayController : IDisposable
     public void ShowPanel()
     {
         var clock = System.Diagnostics.Stopwatch.StartNew();
+
+        // A trim from the last close may still be pending. Collecting now, on the way
+        // into an open, is the one moment it was scheduled to avoid.
+        MemoryTrim.Cancel();
 
         // Last line of defence for the scale cache. DisplaySettingsChanged catches
         // almost every case, but it does not fire for a monitor swapped on the KVM,
@@ -149,12 +157,18 @@ internal sealed class TrayController : IDisposable
         }
         long afterBuild = clock.ElapsedMilliseconds;
 
-        // A cross-process call into explorer's tray, and a blocking one: if explorer
-        // is busy — which on a loaded machine it is — this waits for it on the UI
-        // thread, between the click and anything at all happening. It is not ours to
-        // make faster, so it is measured on its own rather than folded into the
-        // panel's time, and it is the first number to look at in a slow open.
-        var iconRect = _icon?.GetIconRect() ?? Rect.Empty;
+        // Where the icon was as of the last time the shell was asked — during hover,
+        // at registration, or after the previous open. Asking it *here* is a blocking
+        // cross-process call into Explorer, and on a loaded machine (which is when a
+        // power panel gets opened) it used to be the largest single thing between the
+        // click and anything appearing on screen.
+        //
+        // The fallback is not a fast path being given up on: an empty cache means the
+        // shell has never answered, or answered that the icon is in the overflow
+        // flyout, and the alternative to waiting for it is anchoring the panel to a
+        // guess. It costs one slow open, once.
+        var iconRect = _icon?.CachedIconRect ?? Rect.Empty;
+        if (iconRect.IsEmpty) iconRect = _icon?.GetIconRect() ?? Rect.Empty;
         long afterRect = clock.ElapsedMilliseconds;
 
         // The panel finishes the trace and writes it, because the open is not over
@@ -163,6 +177,10 @@ internal sealed class TrayController : IDisposable
         _panel.ShowNear(
             iconRect,
             $"build {afterBuild}{(built ? "" : " cached")}, iconrect {afterRect - afterBuild}");
+
+        // Now that the panel is up, find out where the icon actually is, for the next
+        // open. Off-thread, because this is the call that was on the click path.
+        _icon?.RefreshIconRectInBackground();
     }
 
     /// <summary>

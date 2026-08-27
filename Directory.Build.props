@@ -8,10 +8,19 @@
     <Platforms>x64</Platforms>
     <PlatformTarget>x64</PlatformTarget>
 
-    <!-- Footprint: workstation, non-concurrent GC keeps the working set small and
-         avoids a background GC thread in a process that idles most of the time. -->
+    <!-- Workstation GC: this process has one busy thread and idles the rest of the
+         time, so the server collector's per-core heaps would be pure overhead.
+
+         Background GC is ON, which it did not used to be. Non-concurrent was chosen
+         to save a thread and keep the working set tight, and it does both — but it
+         also means every gen2 is a blocking pause on whichever thread trips it, and
+         the thread that trips it is the one waking every widget on a panel open. On
+         a loaded or TDP-throttled machine that pause lands exactly where the app can
+         least afford it, which is the "opened a second late" this was tuned against.
+         The heap it costs is given back explicitly instead, by MemoryTrim, in the
+         gap after the panel closes where a blocking compacting collection is free. -->
     <ServerGarbageCollection>false</ServerGarbageCollection>
-    <ConcurrentGarbageCollection>false</ConcurrentGarbageCollection>
+    <ConcurrentGarbageCollection>true</ConcurrentGarbageCollection>
     <TieredPGO>false</TieredPGO>
     <AutoreleasePoolSupport>false</AutoreleasePoolSupport>
     <EventSourceSupport>false</EventSourceSupport>
