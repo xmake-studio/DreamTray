@@ -149,34 +149,34 @@ public sealed class BrightnessService : IDisposable
         }
 
         // --- external monitors (DDC/CI) ---
-        var externals = new List<(Target Probe, string Description, int Brightness)>();
-        foreach (var (handle, description) in EnumeratePhysicalMonitors())
+        var externals = new List<(Target Probe, Monitor Monitor, int Brightness)>();
+        foreach (var monitor in EnumeratePhysicalMonitors())
         {
             var probe = new Target
             {
                 Public = new DisplayTarget("", "", DisplayKind.External, true),
-                DdcHandle = handle,
+                DdcHandle = monitor.Handle,
             };
             // A monitor that will not report brightness cannot be set either — most
             // often the internal panel, already covered by WMI above.
-            int current = ReadDdcBrightness(probe);
+            int current = ProbeDdcBrightness(probe, monitor);
             if (current < 0)
             {
-                DestroyPhysicalMonitor(handle);
+                DestroyPhysicalMonitor(monitor.Handle);
                 continue;
             }
-            externals.Add((probe, description, current));
+            externals.Add((probe, monitor, current));
         }
 
         // Numbering only makes sense once we know how many survived the probe: a
         // lone external monitor is just "External display", not "External display 1".
         for (int i = 0; i < externals.Count; i++)
         {
-            var (probe, description, current) = externals[i];
+            var (probe, monitor, current) = externals[i];
             list.Add(new Target
             {
-                Public = new DisplayTarget($"ddc{i + 1}",
-                                           Describe(description, externals.Count == 1 ? null : i + 1),
+                Public = new DisplayTarget(MakeId(monitor),
+                                           Describe(monitor.Description, externals.Count == 1 ? null : i + 1),
                                            DisplayKind.External, true)
                 {
                     Brightness = current,
@@ -213,6 +213,18 @@ public sealed class BrightnessService : IDisposable
 
     /// <summary>Last logged display summary; only written from <see cref="EnumerateCore"/>, which _enumGate serialises.</summary>
     private string? _lastSummary;
+
+    /// <summary>
+    /// A stable id for a monitor across scans. The old scheme numbered survivors in
+    /// enumeration order, so a scan where one monitor did not answer renamed the
+    /// other one — "ddc1" meant a different physical monitor from one scan to the
+    /// next, and a queued write could land on the wrong screen. The GDI device name
+    /// belongs to the adapter output, so it survives a monitor missing a probe.
+    /// </summary>
+    private static string MakeId(Monitor m) =>
+        string.IsNullOrEmpty(m.Device)
+            ? $"ddc:{m.Handle}"
+            : m.Ordinal == 0 ? $"ddc:{m.Device}" : $"ddc:{m.Device}#{m.Ordinal}";
 
     private static string Describe(string description, int? index) =>
         string.IsNullOrWhiteSpace(description) || description == "Generic PnP Monitor"
@@ -404,9 +416,12 @@ public sealed class BrightnessService : IDisposable
     [DllImport("dxva2.dll", SetLastError = true)]
     private static extern bool SetMonitorBrightness(nint hMonitor, uint brightness);
 
-    private static List<(nint Handle, string Description)> EnumeratePhysicalMonitors()
+    /// <summary>One physical monitor behind an HMONITOR, with what identifies it.</summary>
+    private readonly record struct Monitor(nint Handle, string Description, string Device, int Ordinal);
+
+    private static List<Monitor> EnumeratePhysicalMonitors()
     {
-        var result = new List<(nint, string)>();
+        var result = new List<Monitor>();
 
         // dxva2 reports the driver's description, which for most monitors is the
         // useless "Generic PnP Monitor". The CCD API has the EDID name ("PHL 288E2"),
@@ -426,15 +441,56 @@ public sealed class BrightnessService : IDisposable
             {
                 var buf = new PhysicalMonitor[count];
                 if (GetPhysicalMonitorsFromHMONITOR(hMonitor, count, buf))
-                    foreach (var pm in buf)
-                        result.Add((pm.hPhysicalMonitor,
-                                    string.IsNullOrWhiteSpace(friendly)
-                                        ? pm.szPhysicalMonitorDescription
-                                        : friendly));
+                    for (int i = 0; i < buf.Length; i++)
+                        result.Add(new Monitor(buf[i].hPhysicalMonitor,
+                                               string.IsNullOrWhiteSpace(friendly)
+                                                   ? buf[i].szPhysicalMonitorDescription
+                                                   : friendly,
+                                               mi.szDevice ?? "",
+                                               i));
             }
             return true;
         }, nint.Zero);
         return result;
+    }
+
+    /// <summary>Outputs already reported as DDC/CI-deaf; only touched under _enumGate.</summary>
+    private readonly HashSet<string> _loggedDrops = new(StringComparer.OrdinalIgnoreCase);
+
+    /// <summary>How many times a monitor gets to answer the very first read.</summary>
+    private const int ProbeAttempts = 3;
+    private const int ProbeRetryDelayMs = 150;
+
+    /// <summary>
+    /// The enumeration-time read that decides whether a monitor is controllable at all.
+    ///
+    /// Unlike a value refresh this one is given several tries, because a single
+    /// <c>GetMonitorBrightness</c> failure is not evidence that the monitor cannot do
+    /// DDC/CI. The I2C link is shared and unreliable: a monitor that has just powered
+    /// on, finished a resolution change, or is mid-conversation with its own OEM
+    /// utility answers with a failure and then answers correctly 150 ms later. Giving
+    /// up on the first failure is what dropped one of two working monitors — usually
+    /// on the startup scan, where every monitor is at its least responsive — and left
+    /// it dropped, since the scan result is what the panel shows.
+    /// </summary>
+    private int ProbeDdcBrightness(Target t, Monitor m)
+    {
+        for (int attempt = 1; ; attempt++)
+        {
+            int value = ReadDdcBrightness(t);
+            if (value >= 0) return value;
+            if (attempt >= ProbeAttempts)
+            {
+                // Once per output, not once per scan: on a laptop the internal panel
+                // lands here on every single scan (it is driven through WMI instead),
+                // and re-scans are frequent enough to drown the log.
+                if (_loggedDrops.Add(m.Device))
+                    _log($"brightness: {Describe(m.Description, null)} ({m.Device}) did not answer " +
+                         $"DDC/CI in {ProbeAttempts} tries — no slider for it");
+                return -1;
+            }
+            Thread.Sleep(ProbeRetryDelayMs);
+        }
     }
 
     /// <summary>Current brightness as 0..100, or -1 when the monitor refuses DDC/CI.</summary>
