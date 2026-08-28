@@ -43,7 +43,11 @@ public sealed class BrightnessService : IDisposable
     private Thread? _worker;
     private volatile bool _stop;
 
-    public BrightnessService(Action<string> log) => _log = log;
+    public BrightnessService(Action<string> log)
+    {
+        _log = log;
+        _heal = new Timer(_ => QueueScan(null), null, Timeout.Infinite, Timeout.Infinite);
+    }
 
     /// <summary>Internal record pairing a public target with its native handle.</summary>
     private sealed class Target
@@ -89,23 +93,77 @@ public sealed class BrightnessService : IDisposable
     /// which a monitor that is asleep, on another input, or simply slow can stretch
     /// to seconds. Doing that on the UI thread is what made the panel appear late.
     ///
-    /// Overlapping calls collapse into the one already running: the caller is asking
-    /// for "current", and a second scan started 20 ms later cannot be more current
-    /// than the one in flight.
+    /// A request that arrives while a scan is running does not collapse into it. The
+    /// scan in flight started before this call and may have already read the monitor
+    /// the caller is asking about — which is exactly what happens at startup, where
+    /// the warm-up scan is still working through a monitor that has not woken up when
+    /// the user opens the panel. Collapsing dropped that request *and its callback*,
+    /// so the widget kept showing the incomplete list even after the scan in flight
+    /// found every monitor. Another pass is queued instead and the callback waits for
+    /// it.
     /// </summary>
     public void RefreshAsync(Action? onCompleted = null)
     {
-        if (Interlocked.CompareExchange(ref _refreshing, 1, 0) != 0) return;
-        ThreadPool.QueueUserWorkItem(_ =>
-        {
-            try { GetDisplays(refresh: true); }
-            catch (Exception ex) { _log($"display re-scan failed: {ex.Message}"); }
-            finally { Interlocked.Exchange(ref _refreshing, 0); }
-            onCompleted?.Invoke();
-        });
+        // An outside trigger — startup, a panel open, a display change — restarts the
+        // retry ladder: whatever prompted it is new information about the hardware.
+        Interlocked.Exchange(ref _healStep, 0);
+        QueueScan(onCompleted);
     }
 
-    private int _refreshing;
+    private readonly object _requestGate = new();
+    private readonly List<Action> _waiting = [];
+    private bool _scanRunning;
+    private bool _rescanWanted;
+
+    private void QueueScan(Action? onCompleted)
+    {
+        if (_stop) return;
+        lock (_requestGate)
+        {
+            if (onCompleted != null) _waiting.Add(onCompleted);
+            if (_scanRunning)
+            {
+                _rescanWanted = true;
+                return;
+            }
+            _scanRunning = true;
+        }
+        ThreadPool.QueueUserWorkItem(_ => ScanLoop());
+    }
+
+    private void ScanLoop()
+    {
+        while (true)
+        {
+            // Taken before the scan, so a callback only ever fires on a list that was
+            // read after its own request came in.
+            Action[] batch;
+            lock (_requestGate)
+            {
+                batch = [.. _waiting];
+                _waiting.Clear();
+            }
+
+            try { Enumerate(); }
+            catch (Exception ex) { _log($"display re-scan failed: {ex.Message}"); }
+
+            foreach (var callback in batch)
+            {
+                try { callback(); }
+                catch (Exception ex) { _log($"display refresh callback threw: {ex.Message}"); }
+            }
+
+            lock (_requestGate)
+            {
+                if (!_rescanWanted)
+                {
+                    _scanRunning = false;
+                    return;
+                }
+                _rescanWanted = false;
+            }
+        }
+    }
 
     /// <summary>Re-read the current brightness of every display (a few ms each).</summary>
     public void RefreshValues()
@@ -150,6 +208,9 @@ public sealed class BrightnessService : IDisposable
 
         // --- external monitors (DDC/CI) ---
         var externals = new List<(Target Probe, Monitor Monitor, int Brightness)>();
+        // Outputs that are cabled monitors — so they ought to speak DDC/CI — and did
+        // not. These are what the retry ladder below is for.
+        var missing = new List<string>();
         foreach (var monitor in EnumeratePhysicalMonitors())
         {
             var probe = new Target
@@ -163,8 +224,12 @@ public sealed class BrightnessService : IDisposable
             if (current < 0)
             {
                 DestroyPhysicalMonitor(monitor.Handle);
+                if (!monitor.IsInternal) missing.Add(monitor.Device);
                 continue;
             }
+            // It answered, so forget that it was ever written off: if it drops out
+            // again later that is news and deserves a line of its own.
+            _loggedDrops.Remove(monitor.Device);
             externals.Add((probe, monitor, current));
         }
 
@@ -209,6 +274,54 @@ public sealed class BrightnessService : IDisposable
             _lastSummary = summary;
             _log(summary);
         }
+
+        ScheduleHealScan(missing);
+    }
+
+    // ---------------------------------------------------------------- self-healing
+
+    /// <summary>
+    /// Backoff for re-scans after a cabled monitor failed to answer. Roughly a minute
+    /// of patience in total, front-loaded — a monitor that is merely slow to wake is
+    /// back within seconds, and one that is switched to another input or has DDC/CI
+    /// turned off in its menu is never coming back, so retrying forever only costs
+    /// I2C traffic.
+    /// </summary>
+    private static readonly int[] HealDelaysMs = [2_000, 5_000, 10_000, 20_000, 30_000];
+
+    private readonly Timer _heal;
+    /// <summary>How far down <see cref="HealDelaysMs"/> the current run has gone.</summary>
+    private int _healStep;
+
+    /// <summary>
+    /// The scan is the only thing that ever discovers a monitor, and until now the
+    /// only things that ran one were startup, a panel open and a display-settings
+    /// change. So a monitor that was still dozing during the boot scan stayed missing
+    /// — for hours, until something unrelated happened to poke the display config.
+    /// That is the case this exists for: when a cabled output did not answer, come
+    /// back and ask again on a backoff instead of waiting to be asked.
+    ///
+    /// Only ever called from <see cref="EnumerateCore"/>, which _enumGate serialises.
+    /// </summary>
+    private void ScheduleHealScan(List<string> missing)
+    {
+        if (missing.Count == 0)
+        {
+            _healStep = 0;
+            _heal.Change(Timeout.Infinite, Timeout.Infinite);
+            return;
+        }
+
+        int step = _healStep;
+        if (step >= HealDelaysMs.Length) return;   // ladder exhausted; wait for a real trigger
+        _healStep = step + 1;
+
+        if (step == 0)
+            _log($"brightness: {missing.Count} monitor(s) did not answer DDC/CI " +
+                 $"({string.Join(", ", missing)}) — retrying for the next minute");
+        // The timer runs QueueScan, not RefreshAsync: a retry must not reset the
+        // ladder it is itself walking down.
+        _heal.Change(HealDelaysMs[step], Timeout.Infinite);
     }
 
     /// <summary>Last logged display summary; only written from <see cref="EnumerateCore"/>, which _enumGate serialises.</summary>
@@ -416,8 +529,14 @@ public sealed class BrightnessService : IDisposable
     [DllImport("dxva2.dll", SetLastError = true)]
     private static extern bool SetMonitorBrightness(nint hMonitor, uint brightness);
 
-    /// <summary>One physical monitor behind an HMONITOR, with what identifies it.</summary>
-    private readonly record struct Monitor(nint Handle, string Description, string Device, int Ordinal);
+    /// <summary>
+    /// One physical monitor behind an HMONITOR, with what identifies it.
+    /// <c>IsInternal</c> comes from the connector technology: an embedded panel is
+    /// *expected* to ignore DDC/CI (it is driven through WMI instead), so it must not
+    /// be counted as a monitor that went missing.
+    /// </summary>
+    private readonly record struct Monitor(nint Handle, string Description, string Device,
+                                           int Ordinal, bool IsInternal);
 
     private static List<Monitor> EnumeratePhysicalMonitors()
     {
@@ -432,10 +551,9 @@ public sealed class BrightnessService : IDisposable
         EnumDisplayMonitors(nint.Zero, nint.Zero, (hMonitor, _, _, _) =>
         {
             var mi = new MONITORINFOEX { cbSize = Marshal.SizeOf<MONITORINFOEX>() };
-            string friendly = GetMonitorInfo(hMonitor, ref mi) &&
-                              config.TryGetValue(mi.szDevice, out var entry)
-                ? entry.FriendlyName
-                : "";
+            string device = GetMonitorInfo(hMonitor, ref mi) ? mi.szDevice ?? "" : "";
+            config.TryGetValue(device, out var entry);   // absent leaves the default entry
+            string friendly = entry.FriendlyName ?? "";
 
             if (GetNumberOfPhysicalMonitorsFromHMONITOR(hMonitor, out uint count) && count > 0)
             {
@@ -446,8 +564,9 @@ public sealed class BrightnessService : IDisposable
                                                string.IsNullOrWhiteSpace(friendly)
                                                    ? buf[i].szPhysicalMonitorDescription
                                                    : friendly,
-                                               mi.szDevice ?? "",
-                                               i));
+                                               device,
+                                               i,
+                                               entry.IsInternal));
             }
             return true;
         }, nint.Zero);
@@ -457,9 +576,14 @@ public sealed class BrightnessService : IDisposable
     /// <summary>Outputs already reported as DDC/CI-deaf; only touched under _enumGate.</summary>
     private readonly HashSet<string> _loggedDrops = new(StringComparer.OrdinalIgnoreCase);
 
-    /// <summary>How many times a monitor gets to answer the very first read.</summary>
-    private const int ProbeAttempts = 3;
-    private const int ProbeRetryDelayMs = 150;
+    /// <summary>
+    /// Waits between the tries a monitor gets to answer the enumeration read. Growing,
+    /// because the failures that matter cluster right after a power-on: a flat 150 ms
+    /// gap gave a monitor 300 ms in total to wake up, which a cold boot does not
+    /// reliably fit into.
+    /// </summary>
+    private static readonly int[] ProbeRetryDelaysMs = [150, 450];
+    private static int ProbeAttempts => ProbeRetryDelaysMs.Length + 1;
 
     /// <summary>
     /// The enumeration-time read that decides whether a monitor is controllable at all.
@@ -489,7 +613,7 @@ public sealed class BrightnessService : IDisposable
                          $"DDC/CI in {ProbeAttempts} tries — no slider for it");
                 return -1;
             }
-            Thread.Sleep(ProbeRetryDelayMs);
+            Thread.Sleep(ProbeRetryDelaysMs[attempt - 1]);
         }
     }
 
@@ -516,6 +640,8 @@ public sealed class BrightnessService : IDisposable
     public void Dispose()
     {
         _stop = true;
+        _heal.Change(Timeout.Infinite, Timeout.Infinite);
+        _heal.Dispose();
         _wake.Set();
         _worker?.Join(1000);
         lock (_ddcGate)
