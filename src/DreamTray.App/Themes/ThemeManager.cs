@@ -128,7 +128,10 @@ internal static class ThemeManager
         Set(resources, "TextTertiary", dark
             ? Rgba(0xFF, 0xFF, 0xFF, 0x87)
             : Rgba(0x00, 0x00, 0x00, 0x72));
-        Set(resources, "TextOnAccent", dark
+        // Whatever sits *on* the accent has to be read against the accent, not
+        // against the theme: Windows lets the user pick a near-white accent, and on
+        // one of those the light theme's white-on-accent label disappears entirely.
+        Set(resources, "TextOnAccent", IsLight(accent)
             ? Rgba(0x00, 0x00, 0x00, 0xE4)
             : Rgba(0xFF, 0xFF, 0xFF, 0xFF));
 
@@ -138,10 +141,14 @@ internal static class ThemeManager
             ? Rgba(0x26, 0x26, 0x26, 0xFF)
             : Rgba(0xF9, 0xF9, 0xF9, 0xFF));
 
-        // Accent.
+        // Accent. Hover and pressed shift away from whatever the accent happens to
+        // be; keying the direction off the theme instead breaks on a near-white
+        // accent in dark mode, where lightening twice lands on white and the two
+        // states stop being distinguishable.
+        double step = IsLight(accent) ? -1 : 1;
         Set(resources, "AccentBrush", accent);
-        Set(resources, "AccentBrushHover", Shade(accent, dark ? -0.08 : 0.08));
-        Set(resources, "AccentBrushPressed", Shade(accent, dark ? -0.16 : 0.16));
+        Set(resources, "AccentBrushHover", Shade(accent, step * 0.08));
+        Set(resources, "AccentBrushPressed", Shade(accent, step * 0.16));
         Set(resources, "FocusStroke", dark
             ? Rgba(0xFF, 0xFF, 0xFF, 0xFF)
             : Rgba(0x00, 0x00, 0x00, 0xE4));
@@ -183,11 +190,45 @@ internal static class ThemeManager
     }
 
     /// <summary>
-    /// The user's Windows accent colour. Windows stores per-theme variants under
-    /// the DWM key; the plain <c>AccentColor</c> is stored ABGR, not ARGB.
+    /// True when the accent is bright enough that dark text reads better on it than
+    /// light text. sRGB relative luminance, thresholded where WCAG contrast against
+    /// black and against white crosses over.
+    /// </summary>
+    private static bool IsLight(Color c)
+    {
+        static double Channel(byte v)
+        {
+            double s = v / 255.0;
+            return s <= 0.03928 ? s / 12.92 : Math.Pow((s + 0.055) / 1.055, 2.4);
+        }
+        double luminance = 0.2126 * Channel(c.R) + 0.7152 * Channel(c.G) + 0.0722 * Channel(c.B);
+        return luminance > 0.179;
+    }
+
+    /// <summary>
+    /// The user's Windows accent colour, in the shade Windows itself would use for
+    /// this theme.
+    ///
+    /// Windows publishes the accent as a seven-entry ramp — Light3..Light1, the base,
+    /// Dark1..Dark3 — and WinUI's accent fill picks Light2 on a dark background and
+    /// Dark1 on a light one rather than the base colour, which is what keeps controls
+    /// legible whichever end of the range the user picked. Reading the base and
+    /// nudging it by a fixed amount only approximates that, and misses badly at the
+    /// extremes.
+    ///
+    /// The ramp lives under Explorer\Accent as <c>AccentPalette</c>: eight RGBA
+    /// quads, the last a fixed marker. That key is the one Windows always writes.
+    /// The DWM <c>AccentColor</c> value used before this is only present once
+    /// something has set a window colorization — on a machine that has never had one
+    /// it is missing entirely, and every read fell through to the hardcoded blue
+    /// below no matter what the user had chosen.
     /// </summary>
     private static Color ReadAccentColor(bool dark)
     {
+        // Light2 on dark, Dark1 on light — WinUI's own AccentFillColorDefault.
+        var fromPalette = ReadPaletteEntry(dark ? 1 : 4);
+        if (fromPalette is Color ramp) return ramp;
+
         try
         {
             using var key = Registry.CurrentUser.OpenSubKey(
@@ -196,12 +237,33 @@ internal static class ThemeManager
             {
                 var c = Color.FromRgb((byte)(abgr & 0xFF), (byte)((abgr >> 8) & 0xFF),
                                       (byte)((abgr >> 16) & 0xFF));
-                // The raw accent is tuned for the light theme; lift it a little on
-                // dark backgrounds so text on it keeps enough contrast.
+                // Stored ABGR, not ARGB, and tuned for the light theme; lift it a
+                // little on dark backgrounds so text on it keeps enough contrast.
                 return dark ? Shade(c, 0.25) : c;
             }
         }
         catch { /* fall through to the Windows default blue */ }
         return dark ? Color.FromRgb(0x60, 0xCD, 0xFF) : Color.FromRgb(0x00, 0x5F, 0xB8);
+    }
+
+    /// <summary>
+    /// One entry of the accent ramp, or null if the palette is absent or malformed.
+    /// Index 0 is Light3, 3 the base accent, 6 Dark3.
+    /// </summary>
+    private static Color? ReadPaletteEntry(int index)
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent");
+            if (key?.GetValue("AccentPalette") is byte[] palette &&
+                palette.Length >= (index + 1) * 4)
+            {
+                int i = index * 4;
+                return Color.FromRgb(palette[i], palette[i + 1], palette[i + 2]);
+            }
+        }
+        catch { /* caller falls back */ }
+        return null;
     }
 }

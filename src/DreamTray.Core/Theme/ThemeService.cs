@@ -57,6 +57,13 @@ public sealed class ThemeService : IThemeInfo, IDisposable
     /// <summary>Raised on the UI thread when the taskbar theme changes.</summary>
     public event Action? TrayThemeChanged;
 
+    /// <summary>
+    /// Raised on the UI thread when the user picks a different Windows accent colour.
+    /// Separate from <see cref="Changed"/> because the light/dark subscribers rebuild
+    /// their content, and an accent swap only needs the brushes repainted.
+    /// </summary>
+    public event Action? AccentChanged;
+
     private void OnUserPreferenceChanged(object sender, UserPreferenceChangedEventArgs e)
     {
         if (e.Category is not (UserPreferenceCategory.General or UserPreferenceCategory.VisualStyle))
@@ -70,6 +77,7 @@ public sealed class ThemeService : IThemeInfo, IDisposable
     {
         bool appsDark = ReadFlag("AppsUseLightTheme");
         bool trayDark = ReadFlag("SystemUsesLightTheme");
+        long accent = ReadAccentStamp();
 
         bool resolved = _preference switch
         {
@@ -80,13 +88,49 @@ public sealed class ThemeService : IThemeInfo, IDisposable
 
         bool themeChanged = resolved != IsDark;
         bool trayChanged = trayDark != TrayUsesDark;
+        // A zero on either side means the palette could not be read; hold the last
+        // known stamp rather than reporting a change we cannot substantiate. The
+        // first Refresh runs from the constructor, before anyone can subscribe, so
+        // it seeds the stamp either way.
+        bool accentChanged = accent != 0 && _accentStamp != 0 && accent != _accentStamp;
+        if (accent == 0) accent = _accentStamp;
 
         IsDark = resolved;
         WindowsAppsUseDark = appsDark;
         TrayUsesDark = trayDark;
+        _accentStamp = accent;
 
         if (themeChanged) Changed?.Invoke();
         if (trayChanged) TrayThemeChanged?.Invoke();
+        if (accentChanged) AccentChanged?.Invoke();
+    }
+
+    private long _accentStamp;
+
+    /// <summary>
+    /// A value that changes whenever the accent does, without this layer having to
+    /// know how the palette is laid out — that belongs to whoever paints with it.
+    /// Zero means "could not read", which is treated as no change so a transient
+    /// registry failure never causes a spurious repaint.
+    /// </summary>
+    private static long ReadAccentStamp()
+    {
+        try
+        {
+            using var key = Registry.CurrentUser.OpenSubKey(
+                @"Software\Microsoft\Windows\CurrentVersion\Explorer\Accent");
+            if (key?.GetValue("AccentPalette") is byte[] palette && palette.Length > 0)
+            {
+                // FNV-1a. Only equality matters here, so anything with a low enough
+                // collision rate over 32 bytes will do.
+                long hash = unchecked((long)0xCBF29CE484222325);
+                foreach (byte b in palette)
+                    hash = unchecked((hash ^ b) * 0x100000001B3);
+                return hash == 0 ? 1 : hash;
+            }
+        }
+        catch { /* treated as unreadable */ }
+        return 0;
     }
 
     /// <summary>The registry stores "uses *light* theme", so dark is the inverse.</summary>

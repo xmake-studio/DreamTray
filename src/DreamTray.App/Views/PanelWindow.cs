@@ -122,6 +122,35 @@ internal sealed class PanelWindow : Window
     // watchdog thread as well as the UI thread.
     private volatile bool _cloaked;
 
+    // An open happens in two halves — ShowNear, which is synchronous, and the reveal,
+    // which is not — and both are re-entrancy hazards. Every log of a panel that
+    // "would not open" is a picture of that: traces cut off mid-phase, several opens
+    // interleaved into one line, and a window hidden by a click the user made while
+    // it was still cloaked and had never appeared.
+    //
+    // ShowNear pumps, whether or not it means to. Waking the widgets reaches the
+    // hardware, the resizes that causes send window messages, and either can let the
+    // queue run — and what is sitting in that queue, on the machine where this
+    // happens, is the tray clicks the user made while nothing was appearing. Each one
+    // toggles: the panel is IsVisible the moment Show returns, so a click lands as a
+    // dismissal of something the user has never seen, and the open it interrupts
+    // carries on regardless against a window that is now hidden.
+    private bool _inShowNear;
+    // Set for the whole open, reveal included. While it holds, the panel exists as
+    // far as WPF is concerned but has not been on screen yet, so nothing that arrives
+    // can be the user closing it. See IsOpening, HidePanel and TakePendingDismiss.
+    private bool _opening;
+    private long _openStartedTicks;
+    private PendingDismiss _pendingDismiss;
+
+    /// <summary>
+    /// What asked for the panel to go away while it was still on its way to the
+    /// screen. An explicit request is a decision and stands; a deactivation is not,
+    /// because the open moves the foreground around itself, so it is re-decided
+    /// against the window manager once the panel is actually up.
+    /// </summary>
+    private enum PendingDismiss { None, FocusLoss, Explicit }
+
     // Open profiling. One clock runs from the tray click to the panel actually being
     // on screen — which is *after* ShowNear returns, because the reveal is asynchronous
     // — so the trace has to outlive the call that starts it.
@@ -182,7 +211,7 @@ internal sealed class PanelWindow : Window
             // would make the press close the panel and the toggle immediately reopen
             // it, so this one deactivation is left alone.
             if (DismissedByCaller?.Invoke() == true) return;
-            HidePanel();
+            DismissOnFocusLoss();
         };
         SizeChanged += OnSizeChanged;
         PreviewKeyDown += OnKeyDown;
@@ -543,8 +572,63 @@ internal sealed class PanelWindow : Window
         Logging.Log.Write($"panel open abandoned after {total:F0} ms ({why}): {trace}");
     }
 
+    /// <summary>
+    /// True between the tray click and the panel actually reaching the screen — the
+    /// window is shown and active, but cloaked, so there is nothing to look at yet.
+    ///
+    /// Callers use it to tell a click that means "open this" from one that means
+    /// "close it": on a machine slow enough for the open to be worth noticing, a
+    /// second click is the user asking again for a panel they cannot see, and
+    /// treating it as a dismissal is what turns a slow open into no open at all.
+    ///
+    /// Time-limited over the reveal, and not over ShowNear. ShowNear runs on this
+    /// thread, so while it is in there nothing else can be happening anyway and there
+    /// is no honest deadline to give it; the reveal is the half that waits on a frame
+    /// callback and two timers, and it cannot outlast them. Anything past that is a
+    /// bug in here — and the one thing that must never follow from a bug in here is a
+    /// panel the user can no longer close.
+    /// </summary>
+    public bool IsOpening =>
+        _inShowNear ||
+        (_opening &&
+         Environment.TickCount64 - _openStartedTicks
+             < RevealSoftDeadlineMs + RevealHardDeadlineMs + OpenGuardSlackMs);
+
     /// <summary>Position next to the tray icon and show.</summary>
     public void ShowNear(Rect iconRect, string callerTrace = "")
+    {
+        // One open at a time, from any caller and from any depth. An open in flight
+        // has this window halfway through being placed, sized and revealed, and a
+        // second one interleaved with it leaves both to finish against each other's
+        // state — which is what put several opens into one trace and the panel
+        // wherever the loser left it. A refusal rather than a queue: the open already
+        // running is about to put the panel on screen, which is all the caller wanted.
+        //
+        // IsOpening covers both halves: _inShowNear for the re-entrant one — the
+        // widgets' wake-up pumps, and a queued tray click can arrive inside it — and
+        // its own deadline for the reveal, where the window is shown and cloaked and
+        // nothing has appeared yet.
+        if (IsOpening)
+        {
+            Logging.Log.Write(
+                $"panel open ignored: one is already in flight " +
+                $"({(_inShowNear ? "re-entered from inside it" : "awaiting its first frame")})");
+            return;
+        }
+        _inShowNear = true;
+        _opening = true;
+        _pendingDismiss = PendingDismiss.None;
+        try
+        {
+            ShowNearCore(iconRect, callerTrace);
+        }
+        finally
+        {
+            _inShowNear = false;
+        }
+    }
+
+    private void ShowNearCore(Rect iconRect, string callerTrace)
     {
         BeginOpenTrace(callerTrace);
 
@@ -655,19 +739,120 @@ internal sealed class PanelWindow : Window
         // true and a second dismissal (a tray click landing on top of the Deactivated
         // that started this one) would restart the animation from full opacity.
         if (!IsVisible || _closing) return;
+
+        // Hiding a panel that has not appeared yet is the shape of every "it did not
+        // open" report: the window is cloaked, so there is nothing on screen to
+        // dismiss, and tearing the open down half-finished leaves the rest of
+        // ShowNear running against a window it no longer has. Hold the request
+        // instead and act on it once the panel is up — a fraction of a second later,
+        // and from a state that is whole.
+        if (IsOpening)
+        {
+            _pendingDismiss = PendingDismiss.Explicit;
+            Logging.Log.Write("panel hide held: the open it would cancel is not on screen yet");
+            return;
+        }
         AbortOpenTrace(_cloaked ? "still cloaked" : "revealed but not yet traced");
         foreach (var host in _list.Children.OfType<WidgetHost>()) host.CloseSettings();
         if (_addPopup != null) _addPopup.IsOpen = false;
 
         if (!AnimatesClose)
         {
-            StopAnimations();
-            _manager.SetPanelVisible(false);
-            Hide();
-            MemoryTrim.Schedule(Logging.Log.Write);
+            HideNow();
             return;
         }
         AnimateClose();
+    }
+
+    /// <summary>
+    /// Take the panel off the screen with no exit — the end of a close with
+    /// animation off, and the whole of one for a panel that was dismissed before it
+    /// ever appeared. StopAnimations lifts the cloak on the way past, in the same
+    /// dispatcher callback as the Hide, so a cloaked window goes straight from
+    /// invisible to hidden without a frame of it reaching the screen in between.
+    /// </summary>
+    private void HideNow()
+    {
+        StopAnimations();
+        _manager.SetPanelVisible(false);
+        Hide();
+        MemoryTrim.Schedule(Logging.Log.Write);
+    }
+
+    /// <summary>
+    /// The panel lost focus to something that is not the tray icon — ordinarily the
+    /// user clicking away, which closes it.
+    ///
+    /// Ordinarily. Showing a window is itself a foreground change, and the shell is
+    /// handling a click on the taskbar at the same moment, so a deactivation that
+    /// lands inside an open says nothing about what the user wants: it is as likely
+    /// to be the two of them trading the foreground as it is a dismissal. Deciding it
+    /// there is what hid panels that had never been visible. It keeps until the panel
+    /// is on screen, where the window manager can be asked outright.
+    /// </summary>
+    private void DismissOnFocusLoss()
+    {
+        if (IsOpening)
+        {
+            // An explicit dismissal already waiting is the stronger of the two and
+            // must not be downgraded to a decision that might go the other way.
+            if (_pendingDismiss == PendingDismiss.None) _pendingDismiss = PendingDismiss.FocusLoss;
+            Logging.Log.Write("panel deactivated while still cloaked — held until it is on screen");
+            return;
+        }
+        HidePanel();
+    }
+
+    /// <summary>
+    /// Whether the dismissal held during the open still stands, now that the open is
+    /// finished. Clears it either way — it belongs to the open that has just ended.
+    /// </summary>
+    private bool TakePendingDismiss()
+    {
+        var pending = _pendingDismiss;
+        _pendingDismiss = PendingDismiss.None;
+
+        switch (pending)
+        {
+            case PendingDismiss.None:
+                return false;
+
+            // Escape, the settings window opening, a tray click on a panel that was
+            // already up: a decision, and it stands.
+            case PendingDismiss.Explicit:
+                Logging.Log.Write("panel hide held during the open — applying it now");
+                return true;
+
+            // A deactivation is only real if the panel is still not the window the
+            // user is in. If it is, the foreground moved twice during the open and
+            // came back, and there was never anything to dismiss.
+            default:
+                if (WindowEffects.IsForegroundWindow(_hwnd))
+                {
+                    Logging.Log.Write("panel deactivation during the open was transient — staying open");
+                    return false;
+                }
+                Logging.Log.Write("panel dismissed: it lost focus during the open and never got it back");
+                return true;
+        }
+    }
+
+    /// <summary>
+    /// Take the foreground back if the open lost it.
+    ///
+    /// Showing this window moves the foreground, and the shell is handling a click on
+    /// the taskbar at the same moment; between the two the panel can end up on screen
+    /// without being the active window. That is a trap rather than a blemish: the
+    /// panel is dismissed by losing focus, and a window that never had focus never
+    /// loses it, so it would sit there until something unrelated moved. One Activate
+    /// settles it — and if the window manager refuses, the panel is still on screen
+    /// and still answers a click, which is the honest fallback.
+    /// </summary>
+    private void EnsureForeground()
+    {
+        if (!IsVisible || _closing || WindowEffects.IsForegroundWindow(_hwnd)) return;
+        Logging.Log.Write("panel reached the screen without the foreground — reactivating");
+        Activate();
     }
 
     // ---------------------------------------------------------------- animation
@@ -684,6 +869,12 @@ internal sealed class PanelWindow : Window
     // (about 30 ms at 60 Hz) and far shorter than a delay a user would call a delay.
     private const int RevealSoftDeadlineMs = 250;
     private const int RevealHardDeadlineMs = 500;
+    /// <summary>
+    /// How long past the last reveal deadline <see cref="IsOpening"/> keeps claiming
+    /// the panel is on its way. Only a margin for the timer and the dispatcher hop
+    /// that finishes the reveal — it is not a deadline of its own.
+    /// </summary>
+    private const int OpenGuardSlackMs = 250;
 
     /// <summary>
     /// Wait for the cloaked panel to compose one complete frame at its resting
@@ -711,6 +902,10 @@ internal sealed class PanelWindow : Window
     private void BeginReveal(bool slide)
     {
         CancelReveal();
+        // The deadline IsOpening holds the panel against is this one's, so it starts
+        // here rather than at the top of the open: however long the widgets took to
+        // wake up, the reveal still gets the whole of its own budget.
+        _openStartedTicks = Environment.TickCount64;
         _revealSlides = slide;
         _revealForced = false;
         _revealFrames = 0;
@@ -737,6 +932,28 @@ internal sealed class PanelWindow : Window
         // after this the panel is on screen, and a short one takes the bottom of
         // the list with it.
         UpdateCornerRadius();
+        MarkOpen($"reveal({cause},{_revealFrames}f)");
+
+        // The open is over either way: from here the panel is an ordinary window and
+        // a tray click closes it rather than being absorbed.
+        _opening = false;
+
+        // Settle a dismissal held during the open *before* putting the panel up, not
+        // after. Deciding it afterwards would mean interrupting the entrance the line
+        // below has just started — the panel would jump to its resting place only to
+        // play an exit out of it, which is a worse answer than either.
+        if (TakePendingDismiss())
+        {
+            FinishOpenTrace();
+            // The watchdog may have already uncloaked this from the pool thread, in
+            // which case the panel *is* on screen and leaving it gets the ordinary
+            // close, animation and all. Otherwise it is still cloaked at rest and
+            // nobody has seen it, so it goes without an exit.
+            if (_revealForced) HidePanel();
+            else HideNow();
+            return;
+        }
+
         if (_revealSlides && !_revealForced)
         {
             WindowEffects.MoveTo(this, _leftPx, (int)Math.Round(_offscreenTopPx));
@@ -748,8 +965,8 @@ internal sealed class PanelWindow : Window
             Cloak(false);
         }
 
-        MarkOpen($"reveal({cause},{_revealFrames}f)");
         FinishOpenTrace();
+        EnsureForeground();
     }
 
     /// <summary>
@@ -792,6 +1009,12 @@ internal sealed class PanelWindow : Window
         _revealForced = true;
         _cloaked = false;
         WindowEffects.SetCloaked(_hwnd, false);
+        // CompleteReveal is the one that normally clears this, and it needs the
+        // dispatcher — which is exactly what is missing. The window is visible now,
+        // so the flag has to go with it or the panel would be one that cannot be
+        // closed. (IsOpening expires on its own too; this is simply the honest
+        // moment.)
+        _opening = false;
         Logging.Log.Write(
             $"panel reveal: no composed frame and no dispatcher within " +
             $"{RevealSoftDeadlineMs + RevealHardDeadlineMs} ms — uncloaked off-thread");
@@ -1292,6 +1515,8 @@ internal sealed class PanelWindow : Window
         // handle that no longer exists.
         CancelReveal();
         StopSlide();
+        _opening = false;
+        _pendingDismiss = PendingDismiss.None;
         _hwnd = nint.Zero;
         _services.Theme.Changed -= OnThemeChanged;
         _manager.LayoutChanged -= RebuildList;

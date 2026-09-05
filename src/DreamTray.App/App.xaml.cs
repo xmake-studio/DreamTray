@@ -75,6 +75,9 @@ public partial class App : Application
         _services = new AppServices(Dispatcher);
         ApplyTheme(translucent: false);
         _services.Theme.Changed += () => ApplyTheme(_lastTranslucent);
+        // The accent lives in the same brushes, so repainting is the whole response —
+        // every consumer binds it as a DynamicResource.
+        _services.Theme.AccentChanged += () => ApplyTheme(_lastTranslucent);
 
         if (selfTest)
         {

@@ -195,6 +195,17 @@ internal static class WindowEffects
     }
 
     /// <summary>
+    /// Whether this window is the one the user is currently working in.
+    ///
+    /// Asked of the window manager rather than tracked from WPF's Activated and
+    /// Deactivated, because those are what needs checking: showing a window moves the
+    /// foreground about, and both events can arrive out of a sequence that has since
+    /// settled somewhere else entirely. This is where it settled.
+    /// </summary>
+    public static bool IsForegroundWindow(nint hwnd) =>
+        hwnd != nint.Zero && GetForegroundWindow() == hwnd;
+
+    /// <summary>
     /// The bounding box of the clip region currently on the window, in window
     /// coordinates and device pixels. Empty when the window has no region.
     ///
@@ -450,6 +461,9 @@ internal static class WindowEffects
 
     [DllImport("user32.dll")]
     private static extern bool GetCursorPos(out POINT point);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetForegroundWindow();
 
     [DllImport("user32.dll")]
     private static extern bool GetWindowRect(nint hwnd, out RECT rect);

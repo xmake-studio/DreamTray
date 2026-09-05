@@ -88,17 +88,30 @@ internal sealed class TrayController : IDisposable
     // ---------------------------------------------------------------- panel
 
     /// <summary>
-    /// Open if closed, close if open — every time, with nothing debounced or
-    /// swallowed. The panel does not dismiss itself when the tray icon takes focus
-    /// (see DismissedByCaller), so this is the only thing that toggles it and there
-    /// is no second dismissal to disambiguate.
+    /// Open if closed, close if open. The panel does not dismiss itself when the tray
+    /// icon takes focus (see DismissedByCaller), so this is the only thing that
+    /// toggles it and there is no second dismissal to disambiguate.
     ///
     /// IsClosing, not just IsVisible: a panel playing its exit is on its way out and
     /// counts as closed, so a click during the animation turns it straight back
     /// round rather than being absorbed.
+    ///
+    /// IsOpening is the other end of the same idea, and the one that matters on a
+    /// machine where opening takes long enough to notice. Between the click and the
+    /// panel appearing the window is already IsVisible — shown, active, and cloaked —
+    /// so a toggle reads it as open and closes it. But the user has not seen
+    /// anything: their second click means "I asked for the panel", not "take it
+    /// away", and answering it with a dismissal is what turns a slow open into no
+    /// open at all, for as many clicks as they care to make. The open is already on
+    /// its way and bounded by the reveal watchdog, so the click has nothing to add.
     /// </summary>
     private void TogglePanel()
     {
+        if (_panel is { IsOpening: true })
+        {
+            Logging.Log.Write("tray click ignored: the panel is already on its way to the screen");
+            return;
+        }
         if (_panel is { IsVisible: true, IsClosing: false }) _panel.HidePanel();
         else ShowPanel();
     }
@@ -127,6 +140,18 @@ internal sealed class TrayController : IDisposable
 
     public void ShowPanel()
     {
+        // An open that has not reached the screen yet must not be started again on
+        // top of itself. Everything below assumes a settled window: the DPI check can
+        // close and rebuild it, and ShowNear places, sizes and reveals it. Running a
+        // second pass through that from inside the first — which is where a re-entered
+        // click arrives — leaves the two to finish against each other, and the panel
+        // wherever the loser left it.
+        if (_panel is { IsOpening: true })
+        {
+            Logging.Log.Write("panel open ignored: the previous one has not reached the screen yet");
+            return;
+        }
+
         var clock = System.Diagnostics.Stopwatch.StartNew();
 
         // A trim from the last close may still be pending. Collecting now, on the way

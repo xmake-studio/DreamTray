@@ -47,6 +47,14 @@ internal sealed class TrayIcon : IDisposable
     private bool _pressHandled;
 
     /// <summary>
+    /// When the last click this icon acted on was being acted on, in the same clock
+    /// <c>GetMessageTime</c> reports. Zero until the first one. See
+    /// <see cref="RaiseActivated"/>.
+    /// </summary>
+    private int _lastClickHandledAt;
+    private bool _anyClickHandled;
+
+    /// <summary>
     /// Last rectangle the shell gave us, and when. See <see cref="CachedIconRect"/>.
     ///
     /// One immutable object rather than a Rect and a timestamp side by side, because
@@ -263,6 +271,41 @@ internal sealed class TrayIcon : IDisposable
         }, this);
     }
 
+    /// <summary>
+    /// Act on one click, unless it was already in the queue when the previous one was
+    /// acted on.
+    ///
+    /// A tray icon is a toggle, so every click that reaches the app flips the panel —
+    /// which is right for clicks the user makes, and wrong for the ones they make
+    /// while nothing is happening. When the UI thread stalls, the clicks do not go
+    /// anywhere: they pile up behind it, and the moment it comes back they all arrive
+    /// within a few milliseconds of each other and toggle the panel open, shut, open,
+    /// shut. Whether the user is left looking at a panel is then down to how many
+    /// times they clicked, which is not a thing they can be expected to get right.
+    ///
+    /// The message clock separates the two. A click the user made in response to
+    /// something was posted after that something happened; a click from the backlog
+    /// was posted before it. Only the first of a burst was ever a decision, so it is
+    /// the only one that counts, and the panel ends up in the state that click asked
+    /// for rather than in whichever state the parity of the queue landed on.
+    /// </summary>
+    private void RaiseActivated()
+    {
+        int postedAt = GetMessageTime();
+        // Unchecked subtraction, never a comparison: the clock is a 32-bit tick count
+        // and wraps every 49 days, and a wrap under a plain "<" would discard every
+        // click for the length of the queue.
+        if (_anyClickHandled && unchecked(postedAt - _lastClickHandledAt) < 0) return;
+
+        // Claimed before the handler runs as well as after it, because the handler is
+        // what pumps: an open reaches the hardware, and a click dispatched from inside
+        // it would otherwise find the mark still on the click before this one.
+        _anyClickHandled = true;
+        _lastClickHandledAt = Environment.TickCount;
+        try { Activated?.Invoke(); }
+        finally { _lastClickHandledAt = Environment.TickCount; }
+    }
+
     private nint WndProc(nint hwnd, int msg, nint wParam, nint lParam, ref bool handled)
     {
         if (msg == _taskbarCreatedMessage)
@@ -296,7 +339,7 @@ internal sealed class TrayIcon : IDisposable
 
                 case WM_LBUTTONDOWN:
                     _pressHandled = true;
-                    Activated?.Invoke();
+                    RaiseActivated();
                     handled = true;
                     break;
 
@@ -307,7 +350,7 @@ internal sealed class TrayIcon : IDisposable
                 // double click would be dropped.
                 case WM_LBUTTONDBLCLK:
                     _pressHandled = true;
-                    Activated?.Invoke();
+                    RaiseActivated();
                     handled = true;
                     break;
 
@@ -316,7 +359,7 @@ internal sealed class TrayIcon : IDisposable
                     // means anything when no press came with it — the keyboard's
                     // Enter/Space on the focused icon arrives as a bare UP.
                     if (_pressHandled) _pressHandled = false;
-                    else Activated?.Invoke();
+                    else RaiseActivated();
                     handled = true;
                     break;
                 case WM_RBUTTONUP:
@@ -389,6 +432,14 @@ internal sealed class TrayIcon : IDisposable
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterWindowMessage(string message);
+
+    /// <summary>
+    /// When the message being dispatched right now was posted. The tray callback is
+    /// posted by the shell, so this is when the user actually clicked — not when the
+    /// app got round to hearing about it.
+    /// </summary>
+    [DllImport("user32.dll")]
+    private static extern int GetMessageTime();
 
     [DllImport("user32.dll")]
     private static extern int GetSystemMetrics(int index);
