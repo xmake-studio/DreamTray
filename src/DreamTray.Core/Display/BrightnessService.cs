@@ -80,6 +80,57 @@ public sealed class BrightnessService : IDisposable
     /// <summary>True once a scan has completed, so callers know the list is real.</summary>
     private volatile bool _scanned;
 
+    // ------------------------------------------------------------ scan progress
+
+    /// <summary>Cabled monitors that did not answer on the last completed scan.</summary>
+    private volatile int _notResponding;
+    /// <summary>When the last scan finished, in UTC ticks; 0 when none has.</summary>
+    private long _lastScanTicks;
+
+    /// <summary>
+    /// What the enumeration is doing, for the UI to explain the wait. Cheap and
+    /// lock-light: a widget asks this on every rebuild.
+    /// </summary>
+    public DisplayScanStatus Status
+    {
+        get
+        {
+            bool scanning;
+            lock (_requestGate) scanning = _scanRunning;
+            long ticks = Interlocked.Read(ref _lastScanTicks);
+            return new DisplayScanStatus(scanning, _notResponding, _retryScheduled,
+                ticks == 0 ? null : new DateTimeOffset(ticks, TimeSpan.Zero));
+        }
+    }
+
+    /// <summary>
+    /// Raised on a background thread after every completed scan.
+    ///
+    /// The panel used to learn about displays only through the callback of the scan
+    /// it asked for itself, so a monitor found by the retry ladder two seconds later
+    /// — the whole point of that ladder — stayed invisible until the panel was closed
+    /// and opened again. Subscribers get every scan and decide for themselves whether
+    /// anything they draw actually changed.
+    /// </summary>
+    public event Action? DisplaysChanged;
+
+    /// <summary>Listen for completed scans; dispose to stop.</summary>
+    public IDisposable SubscribeChanges(Action onChanged)
+    {
+        DisplaysChanged += onChanged;
+        return new Unsubscriber(this, onChanged);
+    }
+
+    private sealed class Unsubscriber(BrightnessService owner, Action handler) : IDisposable
+    {
+        private Action? _handler = handler;
+        public void Dispose()
+        {
+            var h = Interlocked.Exchange(ref _handler, null);
+            if (h != null) owner.DisplaysChanged -= h;
+        }
+    }
+
     /// <summary>Start the first scan at app start, off the UI thread.</summary>
     public void WarmUp() => RefreshAsync();
 
@@ -147,21 +198,33 @@ public sealed class BrightnessService : IDisposable
             try { Enumerate(); }
             catch (Exception ex) { _log($"display re-scan failed: {ex.Message}"); }
 
+            // Decided before anyone is told, so that a subscriber reading Status from
+            // inside its own callback is not told a scan is running when this loop is
+            // about to return. Another scan starting here is harmless: it takes
+            // _enumGate for itself and this loop only has callbacks left to run.
+            bool more;
+            lock (_requestGate)
+            {
+                more = _rescanWanted;
+                _rescanWanted = false;
+                if (!more) _scanRunning = false;
+            }
+
             foreach (var callback in batch)
             {
                 try { callback(); }
                 catch (Exception ex) { _log($"display refresh callback threw: {ex.Message}"); }
             }
 
-            lock (_requestGate)
+            // Everyone watching, not just whoever asked for this pass — a retry that
+            // finally found a monitor is news to an open panel that requested nothing.
+            foreach (var handler in DisplaysChanged?.GetInvocationList() ?? [])
             {
-                if (!_rescanWanted)
-                {
-                    _scanRunning = false;
-                    return;
-                }
-                _rescanWanted = false;
+                try { ((Action)handler)(); }
+                catch (Exception ex) { _log($"display change handler threw: {ex.Message}"); }
             }
+
+            if (!more) return;
         }
     }
 
@@ -189,6 +252,9 @@ public sealed class BrightnessService : IDisposable
         // a scan can take seconds, and readers asking meanwhile should get the last
         // known displays rather than an empty panel.
         var previous = _targets;
+        var known = new Dictionary<string, Target>(StringComparer.OrdinalIgnoreCase);
+        foreach (var t in previous)
+            if (t.DdcHandle != 0) known[t.Public.Id] = t;
 
         var list = new List<Target>();
 
@@ -211,8 +277,49 @@ public sealed class BrightnessService : IDisposable
         // Outputs that are cabled monitors — so they ought to speak DDC/CI — and did
         // not. These are what the retry ladder below is for.
         var missing = new List<string>();
+        // Handles carried over from the previous list, so the sweep at the end frees
+        // only what nothing points at any more.
+        var carried = new HashSet<nint>();
         foreach (var monitor in EnumeratePhysicalMonitors())
         {
+            // A monitor we already hold a working handle for is not probed again.
+            //
+            // Two reasons. It is the only way to stop a scan from *losing* a monitor:
+            // the probe is a conversation over a shared, flaky I2C link, and a monitor
+            // that has answered every write for the last hour can still fail three
+            // reads in a row while it is busy with its own OSD or a mode change — and
+            // that was taken as "no slider for it", dropping it from the panel until
+            // some later scan happened to catch it in a better mood. It also stops
+            // every re-scan from opening a second handle to a monitor whose first
+            // handle is still open (the previous list is only freed once the new one
+            // is built) — a state some monitors answer badly to, and one that now
+            // happens on every single panel open.
+            if (known.TryGetValue(MakeId(monitor), out var existing))
+            {
+                int value;
+                // One read on the handle we already have, both to refresh the value
+                // and to confirm the handle is still live.
+                lock (_ddcGate) value = ReadDdcBrightness(existing);
+                if (value >= 0)
+                {
+                    DestroyPhysicalMonitor(monitor.Handle);   // freshly opened, unused
+                    carried.Add(existing.DdcHandle);
+                    // Not while a slider drag is still queued: the monitor reports the
+                    // value it has actually reached, which lags where the user has
+                    // dragged to, and writing that back would drag the slider backwards.
+                    bool queued;
+                    lock (_gate) queued = _pending.ContainsKey(existing.Public.Id);
+                    if (!queued) existing.Public.Brightness = value;
+                    _loggedDrops.Remove(monitor.Device);
+                    externals.Add((existing, monitor, existing.Public.Brightness));
+                    continue;
+                }
+                // The handle has gone stale — the monitor was re-plugged or the driver
+                // reloaded behind an unchanged device name. Fall through and probe the
+                // freshly opened one; the dead handle is not in `carried`, so the sweep
+                // at the end frees it.
+            }
+
             var probe = new Target
             {
                 Public = new DisplayTarget("", "", DisplayKind.External, true),
@@ -238,14 +345,17 @@ public sealed class BrightnessService : IDisposable
         for (int i = 0; i < externals.Count; i++)
         {
             var (probe, monitor, current) = externals[i];
+            string id = MakeId(monitor);
+            string name = Describe(monitor.Description, externals.Count == 1 ? null : i + 1);
+            // A carried-over monitor keeps its DisplayTarget instance, so an optimistic
+            // value set by a slider that is still being dragged survives the re-scan.
+            // Only a change of name forces a new one — which is what happens when the
+            // number of externals crosses one and they gain or lose their numbering.
             list.Add(new Target
             {
-                Public = new DisplayTarget(MakeId(monitor),
-                                           Describe(monitor.Description, externals.Count == 1 ? null : i + 1),
-                                           DisplayKind.External, true)
-                {
-                    Brightness = current,
-                },
+                Public = probe.Public.Id == id && probe.Public.Name == name
+                    ? probe.Public
+                    : new DisplayTarget(id, name, DisplayKind.External, true) { Brightness = current },
                 DdcHandle = probe.DdcHandle,
                 MinDdc = probe.MinDdc,
                 MaxDdc = probe.MaxDdc,
@@ -260,10 +370,15 @@ public sealed class BrightnessService : IDisposable
             _scanned = true;
             foreach (var t in previous)
             {
-                if (t.DdcHandle != 0) DestroyPhysicalMonitor(t.DdcHandle);
+                if (t.DdcHandle != 0 && !carried.Contains(t.DdcHandle)) DestroyPhysicalMonitor(t.DdcHandle);
+                // The WMI panel object is re-queried every scan and never carried over,
+                // so the previous one is always ours to release.
                 t.WmiMethods?.Dispose();
             }
         }
+
+        _notResponding = missing.Count;
+        Interlocked.Exchange(ref _lastScanTicks, DateTimeOffset.UtcNow.UtcTicks);
 
         // Re-scans are frequent (every display-settings event, every panel open) and
         // almost always find the same displays; only say something when it changed.
@@ -292,6 +407,8 @@ public sealed class BrightnessService : IDisposable
     private readonly Timer _heal;
     /// <summary>How far down <see cref="HealDelaysMs"/> the current run has gone.</summary>
     private int _healStep;
+    /// <summary>True while another automatic retry is still booked.</summary>
+    private volatile bool _retryScheduled;
 
     /// <summary>
     /// The scan is the only thing that ever discovers a monitor, and until now the
@@ -308,13 +425,22 @@ public sealed class BrightnessService : IDisposable
         if (missing.Count == 0)
         {
             _healStep = 0;
+            _retryScheduled = false;
             _heal.Change(Timeout.Infinite, Timeout.Infinite);
             return;
         }
 
         int step = _healStep;
-        if (step >= HealDelaysMs.Length) return;   // ladder exhausted; wait for a real trigger
+        if (step >= HealDelaysMs.Length)
+        {
+            // Ladder exhausted; wait for a real trigger. Said out loud through the
+            // status, because from here on nothing more will happen on its own and
+            // the user is otherwise left waiting for a retry that is not coming.
+            _retryScheduled = false;
+            return;
+        }
         _healStep = step + 1;
+        _retryScheduled = true;
 
         if (step == 0)
             _log($"brightness: {missing.Count} monitor(s) did not answer DDC/CI " +

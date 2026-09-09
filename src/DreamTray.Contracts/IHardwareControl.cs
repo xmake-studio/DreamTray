@@ -23,6 +23,21 @@ public interface IHardwareControl
         GetDisplays(refresh: true);
         onCompleted?.Invoke();
     }
+    /// <summary>
+    /// What the display scan is doing right now, so a widget can tell the user
+    /// whether the list in front of them is final or still being worked out.
+    /// Answers from memory; never touches hardware.
+    /// </summary>
+    DisplayScanStatus GetDisplayScanStatus() => new(false, 0, false, null);
+    /// <summary>
+    /// Be told when a scan finishes, whatever started it — a panel open, a display
+    /// change, or the retry that comes back for a monitor that did not answer the
+    /// first time. Without this a monitor found two seconds after the panel opened
+    /// stays invisible until the panel is opened again. The callback arrives on a
+    /// background thread; marshal it yourself. Dispose to stop listening; null when
+    /// the implementation has nothing to report.
+    /// </summary>
+    IDisposable? SubscribeDisplayChanges(Action onChanged) => null;
     /// <summary>Set brightness 0..100 on one display. Returns false if the display refused.</summary>
     bool SetBrightness(string displayId, int percent);
     /// <summary>Set brightness 0..100 on every controllable display.</summary>
@@ -117,6 +132,23 @@ public sealed record DisplayTarget(
     /// <summary>Current brightness 0..100, or -1 when it cannot be read.</summary>
     public int Brightness { get; set; } = -1;
 }
+
+/// <summary>
+/// A snapshot of the display enumeration's progress.
+/// </summary>
+/// <param name="Scanning">A scan is running; the current list may still grow.</param>
+/// <param name="NotResponding">
+/// Cabled monitors that were expected to speak DDC/CI and did not, as of the last
+/// completed scan.
+/// </param>
+/// <param name="RetryScheduled">
+/// Another scan is already booked for those monitors. Once this goes false with
+/// <paramref name="NotResponding"/> still set, waiting will not help and the user
+/// has to do something — enable DDC/CI in the monitor menu, or re-scan by hand.
+/// </param>
+/// <param name="LastCompleted">When the last scan finished, or null if none has.</param>
+public sealed record DisplayScanStatus(bool Scanning, int NotResponding, bool RetryScheduled,
+                                       DateTimeOffset? LastCompleted);
 
 public enum DisplayKind
 {

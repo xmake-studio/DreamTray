@@ -189,6 +189,11 @@ public sealed class AppServices : IDisposable
         public void RefreshDisplaysAsync(Action? onCompleted = null) =>
             s.Brightness.RefreshAsync(onCompleted);
 
+        public DisplayScanStatus GetDisplayScanStatus() => s.Brightness.Status;
+
+        public IDisposable? SubscribeDisplayChanges(Action onChanged) =>
+            s.Brightness.SubscribeChanges(onChanged);
+
         public bool SetBrightness(string displayId, int percent) =>
             s.Brightness.SetBrightness(displayId, percent);
 
