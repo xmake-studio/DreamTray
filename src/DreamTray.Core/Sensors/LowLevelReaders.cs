@@ -164,20 +164,46 @@ public sealed class DiskLoadReader : IDisposable
     private readonly PdhArrayCounter _counter = new(@"\PhysicalDisk(*)\% Idle Time");
 
     /// <summary>
-    /// Active time of the system (C:) drive and of the next physical drive, 0..1.
-    /// <paramref name="other"/> is -1 when the machine has only one physical drive.
+    /// One PDH collection for this tick, in whatever order PDH enumerates
+    /// instances (not sorted), with the "_Total" pseudo-instance already
+    /// dropped. Both <see cref="SystemDriveAndOther"/> and
+    /// <see cref="ByLoadDescending"/> must be derived from the SAME call's
+    /// result, not from two separate calls: "% Idle Time" is a rate counter,
+    /// and collecting it twice back-to-back (microseconds apart) starves the
+    /// second collection of a real time delta -- an otherwise-idle drive's
+    /// idle-time-accumulated-since-last-collection reads as ~0 over that
+    /// near-instant window, i.e. computes as ~100% *active*, which is exactly
+    /// backwards. This bit everyone once ReadAll() was added as a second,
+    /// independent collection alongside Read(); Task Manager (which polls the
+    /// same counter on its own schedule) showed the true, near-0% figure.
     /// </summary>
-    public void Read(out float system, out float other, out string otherLabel)
+    public List<(string Name, double Idle)> Collect()
     {
-        system = 0f; other = -1f; otherLabel = "";
-
-        float sys = -1f, rest = -1f;
-        string restLabel = "";
+        var result = new List<(string, double)>();
         foreach (var (name, idle) in _counter.Read())
         {
             if (name.Contains("_Total", StringComparison.OrdinalIgnoreCase)) continue;
-            float active = (float)Math.Clamp((100.0 - idle) / 100.0, 0.0, 1.0);
+            result.Add((name, idle));
+        }
+        return result;
+    }
 
+    private static float ActiveFraction(double idle) => (float)Math.Clamp((100.0 - idle) / 100.0, 0.0, 1.0);
+
+    /// <summary>
+    /// From one <see cref="Collect"/> sample: active time of the system (C:)
+    /// drive and of the next physical drive (in PDH's own enumeration order,
+    /// not necessarily the busiest), 0..1. <paramref name="other"/> is -1 when
+    /// the machine has only one physical drive.
+    /// </summary>
+    public static void SystemDriveAndOther(List<(string Name, double Idle)> sample,
+        out float system, out float other, out string otherLabel)
+    {
+        float sys = -1f, rest = -1f;
+        string restLabel = "";
+        foreach (var (name, idle) in sample)
+        {
+            float active = ActiveFraction(idle);
             if (sys < 0 && name.Contains("C:", StringComparison.OrdinalIgnoreCase)) sys = active;
             else if (rest < 0) { rest = active; restLabel = FirstLetter(name); }
         }
@@ -187,6 +213,15 @@ public sealed class DiskLoadReader : IDisposable
         system = sys;
         other = rest;
         otherLabel = restLabel;
+    }
+
+    /// <summary>From one <see cref="Collect"/> sample: every physical drive's
+    /// active time (0..1) and label, sorted busiest-first.</summary>
+    public static List<(string Label, float Load)> ByLoadDescending(List<(string Name, double Idle)> sample)
+    {
+        var result = sample.Select(s => (Label: FirstLetter(s.Name), Load: ActiveFraction(s.Idle))).ToList();
+        result.Sort((a, b) => b.Load.CompareTo(a.Load));
+        return result;
     }
 
     /// <summary>

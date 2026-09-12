@@ -1,5 +1,6 @@
 using System.Windows;
 using System.Windows.Controls;
+using System.Windows.Interop;
 using System.Windows.Media;
 using DreamTray.App.Interop;
 using DreamTray.App.Widgets;
@@ -54,6 +55,12 @@ internal sealed class SettingsWindow : Window
             {
                 WindowEffects.ExtendFrameIntoClientArea(this);
                 Background = Brushes.Transparent;
+                // A transparent Window.Background is not enough on its own: WPF
+                // composes onto its own render surface, which is opaque black by
+                // default. Without clearing it too, that black shows through
+                // everywhere the Mica material would otherwise be — see
+                // PanelWindow.SetCompositionBackground, which this mirrors.
+                SetCompositionBackground(transparent: true);
             }
         };
         _services.Theme.Changed += OnThemeChanged;
@@ -381,6 +388,14 @@ internal sealed class SettingsWindow : Window
                 Ui.Caption("Run DreamTray.exe --dump from a console to print every detected sensor " +
                            "and the state of each backend."),
                 Ui.LabelRow("Log file", Ui.Button("Open", () => OpenPath(Logging.Log.FilePath)))));
+    }
+
+    /// <summary>See PanelWindow.SetCompositionBackground — same reasoning, same fix.</summary>
+    private void SetCompositionBackground(bool transparent)
+    {
+        if (PresentationSource.FromVisual(this) is not HwndSource source) return;
+        if (source.CompositionTarget is not { } target) return;
+        target.BackgroundColor = transparent ? Colors.Transparent : Colors.Black;
     }
 
     private static void OpenPath(string path)

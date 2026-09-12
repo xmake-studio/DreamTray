@@ -52,6 +52,18 @@ public sealed class SystemSnapshot
     /// <summary>Drive letter of the second drive (e.g. "D:"), empty when absent.</summary>
     public string Disk1Label { get; init; } = "";
 
+    /// <summary>
+    /// Every physical drive's active time (0..1), sorted busiest-first, with
+    /// <see cref="DiskLabels"/> holding the matching drive letter (or an index
+    /// label for a drive with no mounted volume) at the same position. Same
+    /// underlying counter as <see cref="Disk0Load"/>/<see cref="Disk1Load"/>,
+    /// but without their bias toward the system (C:) drive always occupying
+    /// the first slot -- for a machine with more than two drives, this is how
+    /// to find the ones that are actually busy right now.
+    /// </summary>
+    public float[] DiskLoads { get; init; } = [];
+    public string[] DiskLabels { get; init; } = [];
+
     // ---- Battery / power ----
     /// <summary>Battery power flow in W: positive charging, negative discharging.</summary>
     public float BatteryPower { get; init; }

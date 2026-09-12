@@ -50,7 +50,11 @@ public sealed class SensorService : IDisposable
         // LHM reports NaN per-core clocks on several AMD mobile parts; the Win32
         // power API answers everywhere, so it is used unconditionally.
         _cpuFreq.Read(out b.ClockAvg, out b.ClockMax);
-        _diskLoad.Read(out b.Disk0, out b.Disk1, out b.Disk1Label);
+        // One PDH collection, two views derived from it -- see Collect()'s doc
+        // comment for why calling it twice here corrupted D:/E: to a false 100%.
+        var diskSample = _diskLoad.Collect();
+        DiskLoadReader.SystemDriveAndOther(diskSample, out b.Disk0, out b.Disk1, out b.Disk1Label);
+        b.DiskAll = DiskLoadReader.ByLoadDescending(diskSample);
         // LHM exposes commit charge but not pagefile usage, and the two are far apart.
         b.Swap = _pagefile.Read();
 
@@ -86,6 +90,7 @@ public sealed class SensorService : IDisposable
         public float NetDown, NetUp;
         public float Disk0, Disk1 = -1f;
         public string Disk1Label = "";
+        public List<(string Label, float Load)> DiskAll = [];
         /// <summary>Null until something actually measures a rate — never assume 0 W.</summary>
         public float? BattW;
         public float BattLevel = -1f;
@@ -129,6 +134,8 @@ public sealed class SensorService : IDisposable
                 Disk0Load = Disk0,
                 Disk1Load = Disk1,
                 Disk1Label = Disk1Label,
+                DiskLoads = DiskAll.Select(d => d.Load).ToArray(),
+                DiskLabels = DiskAll.Select(d => d.Label).ToArray(),
                 BatteryPower = BattW ?? 0f,
                 BatteryLevel = BattLevel,
                 OnAcPower = OnAc,
@@ -158,8 +165,9 @@ public sealed class SensorService : IDisposable
                     else if (!haveTemp && v > bestTemp) bestTemp = v;
                     break;
                 case SensorType.Power:
-                    if (sen.Name.Contains("Package")) package = v;      // whole APU
-                    else if (sen.Name.Contains("Core #")) coreSum += v; // per-core (SMU)
+                    if (sen.Name.Contains("Package")) package = v;       // whole APU/CPU
+                    else if (sen.Name.Contains("Core #")) coreSum += v;  // AMD: per-core (SMU), sum needed
+                    else if (sen.Name.Contains("Cores")) coreSum = v;    // Intel: already the x86-core aggregate
                     break;
             }
         }
@@ -177,6 +185,7 @@ public sealed class SensorService : IDisposable
     private static void ReadGpu(IHardware hw, Builder b)
     {
         float gpuTemp = 0; int tempRank = -1; // prefer Hot Spot > Core > anything else
+        float gpuPower = 0; int powerRank = -1; // prefer Package > anything else
         foreach (var sen in hw.Sensors)
         {
             if (!sen.Value.HasValue || float.IsNaN(sen.Value.Value)) continue;
@@ -196,8 +205,17 @@ public sealed class SensorService : IDisposable
                 int rank = sen.Name.Contains("Hot Spot") ? 2 : sen.Name.Contains("Core") ? 1 : 0;
                 if (rank > tempRank) { tempRank = rank; gpuTemp = v; }
             }
+            // Note this is SensorType.Power, not the like-named "GPU Power" under
+            // SensorType.Load -- that one is a percentage of the card's TDP limit,
+            // not watts, and averaging the two together would be nonsense.
+            else if (sen.SensorType == SensorType.Power)
+            {
+                int rank = sen.Name.Contains("Package") ? 1 : 0;
+                if (rank > powerRank) { powerRank = rank; gpuPower = v; }
+            }
         }
         b.GpuTemp = gpuTemp;
+        b.GpuW = gpuPower;
     }
 
     /// <summary>
@@ -207,10 +225,18 @@ public sealed class SensorService : IDisposable
     /// there was a single node and the commit sensors carried longer "Virtual
     /// Memory ..." names. Keying off the sensor name alone would therefore let the
     /// commit node overwrite physical RAM, so the node name decides instead.
+    ///
+    /// A newer LHM also reports one further Memory node per installed DIMM, named
+    /// for its manufacturer/part number (e.g. "Kingston - KF3600C18D4/16GX (#1)")
+    /// and carrying only SPD timing data — no Used/Available sensors. Excluding
+    /// just "Virtual" let those through too, and each one silently zeroed the
+    /// reading the "Total Memory" node had just set. Matching the physical node's
+    /// name directly, instead of excluding everything else, is what keeps this to
+    /// the one node that actually has something to report.
     /// </summary>
     private static void ReadMemory(IHardware hw, Builder b)
     {
-        if (hw.Name.Contains("Virtual", StringComparison.OrdinalIgnoreCase)) return;
+        if (!hw.Name.Equals("Total Memory", StringComparison.OrdinalIgnoreCase)) return;
 
         float used = 0, avail = 0;
         foreach (var sen in hw.Sensors)

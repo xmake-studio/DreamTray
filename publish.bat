@@ -12,6 +12,10 @@ rem theme dictionaries and every widget's construction path, and that cost lands
 rem whichever click gets there before the idle prewarm does. Precompiling moves it
 rem to build time, for a few MB of output. It needs the -r below; a RID-less
 rem publish accepts the flag and silently does nothing with it.
+rem
+rem Every project under plugins\ is picked up and staged into dist\plugins\<name>\
+rem automatically -- DreamTray.App.csproj's StageBundledPluginsForPublish target
+rem discovers them by wildcard, so adding a new plugin needs no edit here.
 rem ---------------------------------------------------------------------------
 
 cd /d "%~dp0"
@@ -22,18 +26,6 @@ dotnet publish src\DreamTray.App\DreamTray.App.csproj ^
     -p:PublishSingleFile=false ^
     -p:PublishReadyToRun=true ^
     -o dist
-if errorlevel 1 goto :failed
-
-rem The publish output does not run the app project's plugin staging target, so
-rem copy the bundled plugin across explicitly.
-echo Staging bundled plugins...
-dotnet build plugins\DreamTray.Plugin.CyberVfd\DreamTray.Plugin.CyberVfd.csproj -c Release
-if errorlevel 1 goto :failed
-
-if not exist "dist\plugins\CyberVfd" mkdir "dist\plugins\CyberVfd"
-xcopy /Y /E /I /Q ^
-    "plugins\DreamTray.Plugin.CyberVfd\bin\Release\net8.0-windows\*" ^
-    "dist\plugins\CyberVfd\" >nul
 if errorlevel 1 goto :failed
 
 if not exist "dist\native" mkdir "dist\native"
