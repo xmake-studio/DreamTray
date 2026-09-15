@@ -144,116 +144,32 @@ public sealed class ThemeService : IThemeInfo, IDisposable
         catch { return false; }
     }
 
-    /// <summary>
-    /// Switch Windows itself to light or dark. Sets both flags so the taskbar and
-    /// apps agree, then broadcasts the change so already-running apps repaint.
-    /// </summary>
+    private bool _switching;
+
+    /// <summary>Apply both Windows colour modes through the shell theme manager.</summary>
     public bool SetWindowsDarkMode(bool dark)
     {
+        if (!_dispatcher.CheckAccess())
+            return _dispatcher.Invoke(() => SetWindowsDarkMode(dark));
+        // Shell COM calls may pump messages. Prevent a reentrant theme application.
+        if (_switching) return false;
+        _switching = true;
         try
         {
-            int light = dark ? 0 : 1;
-            // The key has to be flushed and closed *before* the broadcast: registry
-            // writes are lazy, and the secondary taskbars re-read the value the moment
-            // they get the message. Broadcasting first hands them the stale one.
-            using (var key = Registry.CurrentUser.CreateSubKey(PersonalizeKey, writable: true))
-            {
-                if (key == null) return false;
-                key.SetValue("AppsUseLightTheme", light, RegistryValueKind.DWord);
-                key.SetValue("SystemUsesLightTheme", light, RegistryValueKind.DWord);
-                key.Flush();
-            }
-
-            BroadcastThemeChange();
-            _dispatcher.BeginInvoke(DispatcherPriority.Background, Refresh);
-            return true;
+            WindowsThemeSwitcher.Apply(dark);
+            Refresh();
+            bool applied = WindowsAppsUseDark == dark && TrayUsesDark == dark;
+            Logging.Log.Write($"theme: shell apply {(dark ? "dark" : "light")}, verified={applied}");
+            return applied;
         }
-        catch { return false; }
-    }
-
-    private const int WM_SETTINGCHANGE = 0x001A;
-    private const int HWND_BROADCAST = 0xFFFF;
-    private const int SMTO_ABORTIFHUNG = 0x0002;
-
-    /// <summary>
-    /// Tells running windows the colours changed. The system-wide broadcast covers
-    /// ordinary apps and the primary taskbar, but the per-monitor taskbars
-    /// (<c>Shell_SecondaryTrayWnd</c>) only repaint their foreground from it and
-    /// re-read the background from the registry — so they get a direct message too,
-    /// or a dark theme leaves white text on a white bar.
-    /// </summary>
-    private static void BroadcastThemeChange()
-    {
-        // Windows caches the resolved immersive colour set per process, and the
-        // broadcast below only asks windows to repaint — it does not invalidate that
-        // cache. Explorer's primary taskbar re-resolves anyway; the per-monitor ones
-        // repaint from the cached set, giving new foreground on old background. This
-        // flush is what Settings does and what we were missing.
-        RefreshImmersiveColorPolicy();
-
-        // Per-window timeout on a system-wide send. Explorer under load blows through
-        // a short one, and SMTO_ABORTIFHUNG then drops the notification silently.
-        SendMessageTimeout(HWND_BROADCAST, WM_SETTINGCHANGE, nint.Zero, "ImmersiveColorSet",
-                           SMTO_ABORTIFHUNG, 1000, out _);
-
-        foreach (nint taskbar in FindTaskbars())
-            SendMessageTimeout(taskbar, WM_SETTINGCHANGE, nint.Zero, "ImmersiveColorSet",
-                               SMTO_ABORTIFHUNG, 1000, out _);
-    }
-
-    /// <summary>The primary taskbar plus one window per additional monitor.</summary>
-    private static List<nint> FindTaskbars()
-    {
-        var found = new List<nint>();
-
-        nint primary = FindWindow("Shell_TrayWnd", null);
-        if (primary != nint.Zero) found.Add(primary);
-
-        var buffer = new System.Text.StringBuilder(64);
-        EnumWindows((hWnd, _) =>
+        catch (Exception ex)
         {
-            buffer.Clear();
-            if (GetClassName(hWnd, buffer, buffer.Capacity) > 0 &&
-                buffer.ToString() == "Shell_SecondaryTrayWnd")
-            {
-                found.Add(hWnd);
-            }
-            return true;
-        }, nint.Zero);
-
-        return found;
+            Logging.Log.Write($"theme: shell apply failed: {ex}");
+            Refresh();
+            return false;
+        }
+        finally { _switching = false; }
     }
-
-    /// <summary>
-    /// Drops the cached immersive colour set so the next repaint re-resolves it.
-    /// Exported from uxtheme.dll by ordinal only — it is undocumented and carries no
-    /// name, so a future Windows build could drop it. Failing to flush costs us the
-    /// old rendering bug, not a crash, so this stays best-effort.
-    /// </summary>
-    private static void RefreshImmersiveColorPolicy()
-    {
-        try { RefreshImmersiveColorPolicyState(); }
-        catch (EntryPointNotFoundException) { }
-        catch (DllNotFoundException) { }
-    }
-
-    [System.Runtime.InteropServices.DllImport("uxtheme.dll", EntryPoint = "#104", SetLastError = false)]
-    private static extern void RefreshImmersiveColorPolicyState();
-
-    private delegate bool EnumWindowsProc(nint hWnd, nint lParam);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-    private static extern nint SendMessageTimeout(nint hWnd, int msg, nint wParam, string lParam,
-                                                   int flags, int timeout, out nint result);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-    private static extern nint FindWindow(string? lpClassName, string? lpWindowName);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll")]
-    private static extern bool EnumWindows(EnumWindowsProc lpEnumFunc, nint lParam);
-
-    [System.Runtime.InteropServices.DllImport("user32.dll", CharSet = System.Runtime.InteropServices.CharSet.Unicode)]
-    private static extern int GetClassName(nint hWnd, System.Text.StringBuilder lpClassName, int nMaxCount);
 
     public void Dispose() => SystemEvents.UserPreferenceChanged -= OnUserPreferenceChanged;
 }

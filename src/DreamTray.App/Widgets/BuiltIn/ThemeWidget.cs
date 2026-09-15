@@ -71,7 +71,11 @@ internal sealed class ThemeWidget(IWidgetContext context) : WidgetBase(context)
                 _toggle = Ui.Switch(Host.Theme.IsDark, dark =>
                 {
                     if (_suppress) return;
-                    Hardware.SetWindowsDarkMode(dark);
+                    if (!Hardware.SetWindowsDarkMode(dark))
+                    {
+                        SyncFromSystem();
+                        Host.Notify("Windows theme", "Could not apply the Windows theme. See the DreamTray log for details.");
+                    }
                 });
                 _toggle.ToolTip = "Dark mode";
 
