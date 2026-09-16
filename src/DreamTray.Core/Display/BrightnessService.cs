@@ -53,7 +53,10 @@ public sealed class BrightnessService : IDisposable
     private sealed class Target
     {
         public required DisplayTarget Public { get; init; }
-        public nint DdcHandle { get; init; }          // 0 for the WMI-driven panel
+        // A physical-monitor HANDLE can be zero (observed on the MSI G273Q).
+        // Track ownership separately; zero is not an absence marker here.
+        public bool HasDdcHandle { get; init; }
+        public nint DdcHandle { get; init; }
         /// <summary>
         /// The live <c>WmiMonitorBrightnessMethods</c> instance for the built-in
         /// panel; null for DDC monitors. Held rather than re-queried per write:
@@ -61,6 +64,10 @@ public sealed class BrightnessService : IDisposable
         /// </summary>
         public ManagementObject? WmiMethods { get; init; }
         public int MinDdc, MaxDdc;
+        public bool UseVcp;
+        public int VcpReadError, BrightnessReadError;
+        public bool VcpReadSucceeded, BrightnessReadSucceeded;
+        public uint VcpCurrent, VcpMaximum, BrightnessMinimum, BrightnessCurrent, BrightnessMaximum;
     }
 
     // ---------------------------------------------------------------- enumeration
@@ -254,7 +261,7 @@ public sealed class BrightnessService : IDisposable
         var previous = _targets;
         var known = new Dictionary<string, Target>(StringComparer.OrdinalIgnoreCase);
         foreach (var t in previous)
-            if (t.DdcHandle != 0) known[t.Public.Id] = t;
+            if (t.HasDdcHandle) known[t.Public.Id] = t;
 
         var list = new List<Target>();
 
@@ -323,6 +330,7 @@ public sealed class BrightnessService : IDisposable
             var probe = new Target
             {
                 Public = new DisplayTarget("", "", DisplayKind.External, true),
+                HasDdcHandle = true,
                 DdcHandle = monitor.Handle,
             };
             // A monitor that will not report brightness cannot be set either — most
@@ -357,8 +365,10 @@ public sealed class BrightnessService : IDisposable
                     ? probe.Public
                     : new DisplayTarget(id, name, DisplayKind.External, true) { Brightness = current },
                 DdcHandle = probe.DdcHandle,
+                HasDdcHandle = true,
                 MinDdc = probe.MinDdc,
                 MaxDdc = probe.MaxDdc,
+                UseVcp = probe.UseVcp,
             });
         }
 
@@ -370,7 +380,7 @@ public sealed class BrightnessService : IDisposable
             _scanned = true;
             foreach (var t in previous)
             {
-                if (t.DdcHandle != 0 && !carried.Contains(t.DdcHandle)) DestroyPhysicalMonitor(t.DdcHandle);
+                if (t.HasDdcHandle && !carried.Contains(t.DdcHandle)) DestroyPhysicalMonitor(t.DdcHandle);
                 // The WMI panel object is re-queried every scan and never carried over,
                 // so the previous one is always ours to release.
                 t.WmiMethods?.Dispose();
@@ -655,6 +665,15 @@ public sealed class BrightnessService : IDisposable
     [DllImport("dxva2.dll", SetLastError = true)]
     private static extern bool SetMonitorBrightness(nint hMonitor, uint brightness);
 
+    private const byte BrightnessVcpCode = 0x10;
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool GetVCPFeatureAndVCPFeatureReply(
+        nint hMonitor, byte code, nint codeType, out uint current, out uint maximum);
+
+    [DllImport("dxva2.dll", SetLastError = true)]
+    private static extern bool SetVCPFeature(nint hMonitor, byte code, uint value);
+
     /// <summary>
     /// One physical monitor behind an HMONITOR, with what identifies it.
     /// <c>IsInternal</c> comes from the connector technology: an embedded panel is
@@ -736,7 +755,12 @@ public sealed class BrightnessService : IDisposable
                 // and re-scans are frequent enough to drown the log.
                 if (_loggedDrops.Add(m.Device))
                     _log($"brightness: {Describe(m.Description, null)} ({m.Device}) did not answer " +
-                         $"DDC/CI in {ProbeAttempts} tries — no slider for it");
+                         $"DDC/CI in {ProbeAttempts} tries " +
+                         $"(VCP error {t.VcpReadError}, brightness error {t.BrightnessReadError}) " +
+                         $"[VCP {t.VcpReadSucceeded}: {t.VcpCurrent}/{t.VcpMaximum}; " +
+                         $"high {t.BrightnessReadSucceeded}: {t.BrightnessMinimum}/" +
+                         $"{t.BrightnessCurrent}/{t.BrightnessMaximum}] " +
+                         "— no slider for it");
                 return -1;
             }
             Thread.Sleep(ProbeRetryDelaysMs[attempt - 1]);
@@ -746,10 +770,37 @@ public sealed class BrightnessService : IDisposable
     /// <summary>Current brightness as 0..100, or -1 when the monitor refuses DDC/CI.</summary>
     private int ReadDdcBrightness(Target t)
     {
-        if (t.DdcHandle == 0) return -1;
-        if (!GetMonitorBrightness(t.DdcHandle, out uint min, out uint cur, out uint max)) return -1;
+        if (!t.HasDdcHandle) return -1;
+        // Query the brightness VCP code directly. Some monitors answer this command
+        // while Windows' high-level brightness wrapper rejects the same display.
+        bool vcpRead = GetVCPFeatureAndVCPFeatureReply(t.DdcHandle, BrightnessVcpCode,
+            nint.Zero, out uint vcpCurrent, out uint vcpMax);
+        t.VcpReadSucceeded = vcpRead;
+        t.VcpCurrent = vcpCurrent;
+        t.VcpMaximum = vcpMax;
+        t.VcpReadError = vcpRead ? 0 : Marshal.GetLastWin32Error();
+        if (vcpRead && vcpMax > 0 && vcpMax <= int.MaxValue)
+        {
+            t.MinDdc = 0;
+            t.MaxDdc = (int)vcpMax;
+            t.UseVcp = true;
+            return (int)Math.Round(vcpCurrent * 100.0 / vcpMax);
+        }
+
+        bool brightnessRead = GetMonitorBrightness(t.DdcHandle, out uint min, out uint cur, out uint max);
+        t.BrightnessReadSucceeded = brightnessRead;
+        t.BrightnessMinimum = min;
+        t.BrightnessCurrent = cur;
+        t.BrightnessMaximum = max;
+        if (!brightnessRead)
+        {
+            t.BrightnessReadError = Marshal.GetLastWin32Error();
+            return -1;
+        }
+        t.BrightnessReadError = 0;
         if (max <= min) return -1;
         t.MinDdc = (int)min; t.MaxDdc = (int)max;
+        t.UseVcp = false;
         return (int)Math.Round((cur - min) * 100.0 / (max - min));
     }
 
@@ -759,7 +810,10 @@ public sealed class BrightnessService : IDisposable
         int min = t.MaxDdc > t.MinDdc ? t.MinDdc : 0;
         int max = t.MaxDdc > t.MinDdc ? t.MaxDdc : 100;
         uint raw = (uint)Math.Round(min + (max - min) * percent / 100.0);
-        if (!SetMonitorBrightness(t.DdcHandle, raw))
+        bool written = t.UseVcp
+            ? SetVCPFeature(t.DdcHandle, BrightnessVcpCode, raw)
+            : SetMonitorBrightness(t.DdcHandle, raw);
+        if (!written)
             _log($"DDC/CI write rejected by {t.Public.Name}");
     }
 
@@ -774,7 +828,7 @@ public sealed class BrightnessService : IDisposable
         {
             foreach (var t in _targets)
             {
-                if (t.DdcHandle != 0) DestroyPhysicalMonitor(t.DdcHandle);
+                if (t.HasDdcHandle) DestroyPhysicalMonitor(t.DdcHandle);
                 t.WmiMethods?.Dispose();
             }
             _targets = [];
