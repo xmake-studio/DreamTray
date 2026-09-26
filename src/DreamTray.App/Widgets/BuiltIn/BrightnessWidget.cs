@@ -39,6 +39,13 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
     private DispatcherTimer? _tick;
     private DateTime _scanAskedAt;
     /// <summary>
+    /// Whether the scan in flight should announce itself when slow. The re-scan on
+    /// every panel open runs behind sliders that already work, so a "checking" line
+    /// there only makes the panel jump in height as it comes and goes. It is worth
+    /// saying when the user asked for the scan, or when there is nothing shown yet.
+    /// </summary>
+    private bool _announceScan;
+    /// <summary>
     /// How long a scan has to be out before the widget admits to it. A scan of
     /// monitors that are awake takes ~130 ms, which is inside the panel's open
     /// animation: a line that appears and disappears in there is a flicker and a
@@ -88,7 +95,7 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
         // retry that finally reaches a monitor which was asleep at open time is
         // exactly the result worth showing without making the user close and reopen.
         _watch ??= Hardware.SubscribeDisplayChanges(OnScanCompleted);
-        RefreshDisplays();
+        RefreshDisplays(announce: false);
     }
 
     public override void OnVisibilityChanged(bool visible)
@@ -101,9 +108,12 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
     }
 
     /// <summary>Re-scan in the background and update when the new list lands.</summary>
-    private void RefreshDisplays()
+    private void RefreshDisplays() => RefreshDisplays(announce: true);
+
+    private void RefreshDisplays(bool announce)
     {
         if (_rows == null) return;
+        _announceScan = announce;
         // Ask, then say so: the status is what tells the user whether the list in
         // front of them is final or a scan is still working through a slow monitor.
         _scanAskedAt = DateTime.UtcNow;
@@ -177,7 +187,8 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
     {
         if (_status == null) return;
         var status = Hardware.GetDisplayScanStatus();
-        bool slow = status.Scanning && DateTime.UtcNow - _scanAskedAt >= SlowScan;
+        bool slow = status.Scanning && DateTime.UtcNow - _scanAskedAt >= SlowScan
+                    && (_announceScan || _controls.Count == 0);
 
         string text =
             slow ? "Checking displays…"
