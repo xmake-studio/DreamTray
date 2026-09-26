@@ -289,6 +289,17 @@ public sealed class BrightnessService : IDisposable
         var carried = new HashSet<nint>();
         foreach (var monitor in EnumeratePhysicalMonitors())
         {
+            // The embedded panel is already driven through WMI. Never probe it over
+            // DDC/CI as well: on some laptop GPUs its physical-monitor handle does
+            // answer, but the I2C traffic is routed to another output — the panel
+            // then showed up a second time under its EDID name, and dragging that
+            // slider changed an external monitor's brightness instead.
+            if (monitor.IsInternal && wmiMethods != null)
+            {
+                DestroyPhysicalMonitor(monitor.Handle);
+                continue;
+            }
+
             // A monitor we already hold a working handle for is not probed again.
             //
             // Two reasons. It is the only way to stop a scan from *losing* a monitor:
