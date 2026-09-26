@@ -38,6 +38,10 @@ public sealed class CyberLcdPlugin : DreamPluginBase
     /// the last one on its own clock when the host sampler stalls.
     /// </summary>
     private SystemSnapshot? _latest;
+    private CancellationTokenSource? _weatherStop;
+    private float? _outdoorCelsius;
+    private WeatherLocation? _weatherLocation;
+    private long _weatherRevision;
 
     private string _status = "stopped";
 
@@ -146,6 +150,24 @@ public sealed class CyberLcdPlugin : DreamPluginBase
         set => Host.Storage.Set("deskLedCount", value);
     }
 
+    private string WeatherName
+    {
+        get => Host.Storage.Get("weatherName", "");
+        set => Host.Storage.Set("weatherName", value);
+    }
+
+    private double WeatherLatitude
+    {
+        get => Host.Storage.Get("weatherLatitude", double.NaN);
+        set => Host.Storage.Set("weatherLatitude", value);
+    }
+
+    private double WeatherLongitude
+    {
+        get => Host.Storage.Get("weatherLongitude", double.NaN);
+        set => Host.Storage.Set("weatherLongitude", value);
+    }
+
     /// <summary>Connection state, for the settings page and the widget.</summary>
     public string Status
     {
@@ -163,9 +185,15 @@ public sealed class CyberLcdPlugin : DreamPluginBase
         if (_worker != null) return;
 
         _stop = false;
+        double latitude = WeatherLatitude, longitude = WeatherLongitude;
+        lock (_gate) _weatherLocation = ValidLocation(latitude, longitude)
+            ? new WeatherLocation(WeatherName, latitude, longitude) : null;
         int generation = _generation;
         _worker = new Thread(() => Run(generation)) { IsBackground = true, Name = "cyberlcd-link" };
         _worker.Start();
+        _weatherStop = new CancellationTokenSource();
+        var weatherToken = _weatherStop.Token;
+        _ = Task.Run(() => WeatherLoopAsync(weatherToken));
 
         // One sample per second is what the firmware's ~5s watchdog and the
         // display refresh expect; the worker's own clock is what actually keeps
@@ -184,6 +212,8 @@ public sealed class CyberLcdPlugin : DreamPluginBase
     {
         _subscription?.Dispose();
         _subscription = null;
+        _weatherStop?.Cancel();
+        _weatherStop = null;
 
         _stop = true;
         _generation++;
@@ -241,10 +271,11 @@ public sealed class CyberLcdPlugin : DreamPluginBase
             if (ok && now >= nextFrameAt)
             {
                 SystemSnapshot? snapshot;
-                lock (_gate) snapshot = _latest;
+                float? outdoor;
+                lock (_gate) { snapshot = _latest; outdoor = _outdoorCelsius; }
 
                 if (DevicePower && snapshot != null)
-                    ok = _link.Send(CyberLcdFrame.Build(snapshot, DateTime.Now));
+                    ok = _link.Send(CyberLcdFrame.Build(snapshot, DateTime.Now, outdoor));
 
                 nextFrameAt = now + FramePeriodMs;
             }
@@ -432,6 +463,46 @@ public sealed class CyberLcdPlugin : DreamPluginBase
     private static Color ParseColor(string hex) =>
         CyberLcdFrame.TryParseHex(hex, out var c) ? c : Colors.White;
 
+    internal void SetWeatherLocation(WeatherLocation location)
+    {
+        WeatherName = location.Name;
+        WeatherLatitude = location.Latitude;
+        WeatherLongitude = location.Longitude;
+        lock (_gate) { _weatherLocation = location; _outdoorCelsius = null; _weatherRevision++; }
+        _wake.Set();
+    }
+
+    private static bool ValidLocation(double latitude, double longitude) =>
+        double.IsFinite(latitude) && double.IsFinite(longitude) &&
+        Math.Abs(latitude) <= 90 && Math.Abs(longitude) <= 180;
+
+    private async Task WeatherLoopAsync(CancellationToken token)
+    {
+        long seenRevision = -1;
+        DateTime nextFetch = DateTime.MinValue;
+        while (!token.IsCancellationRequested)
+        {
+            long revision;
+            WeatherLocation? location;
+            lock (_gate) { revision = _weatherRevision; location = _weatherLocation; }
+            if (revision != seenRevision) { seenRevision = revision; nextFetch = DateTime.MinValue; }
+            if (DateTime.UtcNow >= nextFetch)
+            {
+                if (location is WeatherLocation place)
+                {
+                    var value = await OutdoorWeather.ReadCelsiusAsync(place, token);
+                    lock (_gate)
+                        if (revision == _weatherRevision) _outdoorCelsius = value;
+                    nextFetch = DateTime.UtcNow.Add(value.HasValue ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(5));
+                    _wake.Set();
+                }
+                else nextFetch = DateTime.UtcNow.AddMinutes(1);
+            }
+            try { await Task.Delay(1000, token); }
+            catch (OperationCanceledException) { break; }
+        }
+    }
+
     // ---------------------------------------------------------------- UI
 
     public override IEnumerable<IWidgetFactory> Widgets => [new CyberLcdWidgetFactory(this)];
@@ -445,7 +516,8 @@ public sealed class CyberLcdPlugin : DreamPluginBase
         DisplayMode, ParseColor(DisplayColorHex), CyberLcdFrame.ParseStops(DisplayGradientWire),
         DisplayRainbowSpeed, DisplayRainbowWidth,
         DeskMode, ParseColor(DeskColorHex), CyberLcdFrame.ParseStops(DeskGradientWire),
-        DeskRainbowSpeed, DeskRainbowWidth, DeskLedCount);
+        DeskRainbowSpeed, DeskRainbowWidth, DeskLedCount,
+        WeatherName, WeatherLatitude, WeatherLongitude);
 }
 
 internal readonly record struct CyberLcdState(
@@ -454,4 +526,5 @@ internal readonly record struct CyberLcdState(
     string DisplayMode, Color DisplayColor, List<RgbStop> DisplayGradient,
     float DisplayRainbowSpeed, float DisplayRainbowWidth,
     string DeskMode, Color DeskColor, List<RgbStop> DeskGradient,
-    float DeskRainbowSpeed, float DeskRainbowWidth, int DeskLedCount);
+    float DeskRainbowSpeed, float DeskRainbowWidth, int DeskLedCount,
+    string WeatherName, double WeatherLatitude, double WeatherLongitude);

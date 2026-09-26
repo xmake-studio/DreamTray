@@ -26,6 +26,7 @@ project). Without one the plugin loads, finds nothing, and sits in
 | Control | Effect |
 |---|---|
 | Serial port | `Auto-detect` (default) handshakes every COM port; or pin a specific one. |
+| Outdoor temperature location | Search for a place and select the matching result. The chosen name and coordinates are saved only in local DreamTray settings. The panel shows `OUT --` until a place is selected or while all weather services are unavailable. |
 | Panel power | Master off blanks the panel and its backlight strip. Does **not** touch the desk strip -- see below. |
 | Display brightness | Brightness of the display's own backlight strip (behind the panel), 0-255 shown as a percentage. |
 | Desk strip brightness | Brightness of the external desk-perimeter strip, 0-255 shown as a percentage. |
@@ -63,7 +64,7 @@ other's device. 115200 baud, DTR and RTS asserted.
 
 **Wire format** ([`CyberLcdFrame.cs`](CyberLcdFrame.cs)) -- one
 newline-terminated ASCII frame per update, `.`-decimal, `|`-separated,
-starting with `D`: time, date, CPU temp/clocks/power, RAM, GPU (including
+starting with `D`: time, outdoor temperature in °C (or `-` if unavailable), CPU temp/clocks/power, RAM, GPU (including
 GPU power, standing in for a VRAM clock DreamTray doesn't track), VRAM,
 net, then the **two busiest physical drives right now** (each as busy-%
 plus its own dynamic label -- not a fixed C:/D: pair, and not read/write
@@ -71,6 +72,13 @@ KB/s, which DreamTray doesn't track), then exactly twenty per-thread load
 values. The firmware drops frames with the wrong field count, so this must
 match `applyPacket` in `src/graphics/renderers/lcd_monitor_renderer.h`
 exactly.
+
+The PC refreshes outdoor temperature every 10 minutes, retrying after 5 minutes
+on failure. It first uses measured temperature from airport METARs within 60 km
+(aviationweather.gov, reports up to 90 minutes old, blended by inverse squared
+distance), then falls back to the Open-Meteo, wttr.in and 7Timer forecasts.
+Forecast models can miss local showers by several degrees. Location search uses
+Open-Meteo geocoding. The microcontroller makes no network requests.
 
 Control frames: `C|PWR|`, `C|DBR|`/`C|KBR|` (display/desk brightness),
 `C|DM|`/`C|KM|` (display/desk RGB mode -- `T` for Temperature, `S|RRGGBB`

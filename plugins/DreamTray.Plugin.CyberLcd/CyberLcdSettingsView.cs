@@ -21,6 +21,9 @@ internal sealed class CyberLcdSettingsView : UserControl
     private readonly ComboBox _portCombo;
     private readonly StackPanel _displayEditorHost = new();
     private readonly StackPanel _deskEditorHost = new();
+    private readonly ComboBox _weatherResults = PluginUi.StyledCombo(280);
+    private readonly Grid _weatherResultsRow;
+    private readonly TextBlock _weatherStatus = PluginUi.Caption("");
 
     public CyberLcdSettingsView(CyberLcdPlugin plugin)
     {
@@ -72,6 +75,42 @@ internal sealed class CyberLcdSettingsView : UserControl
         rescan.HorizontalAlignment = HorizontalAlignment.Left;
         rescan.Margin = new Thickness(0, 14, 0, 0);
 
+        var weatherSearch = PluginUi.TextInput(state.WeatherName);
+        _weatherResultsRow = PluginUi.LabelRow("Search results", _weatherResults);
+        _weatherResultsRow.Visibility = Visibility.Collapsed;
+        var findWeather = PluginUi.Button("Find location", async () =>
+        {
+            string query = weatherSearch.Text.Trim();
+            if (query.Length < 2) { _weatherStatus.Text = "Enter at least two characters."; return; }
+            _weatherStatus.Text = "Searching…";
+            _weatherResults.Items.Clear();
+            _weatherResultsRow.Visibility = Visibility.Collapsed;
+            try
+            {
+                var places = await OutdoorWeather.SearchAsync(query);
+                foreach (var place in places) _weatherResults.Items.Add(place);
+                _weatherResultsRow.Visibility = places.Count == 0 ? Visibility.Collapsed : Visibility.Visible;
+                _weatherStatus.Text = places.Count == 0 ? "No locations found." : "Select the matching location below.";
+            }
+            catch (Exception) { _weatherStatus.Text = "Location search failed. Try again later."; }
+        });
+        _weatherResults.SelectionChanged += (_, _) =>
+        {
+            if (_weatherResults.SelectedItem is WeatherLocation place)
+            {
+                _plugin.SetWeatherLocation(place);
+                _weatherStatus.Text = "Selected: " + place.Display;
+                _weatherResultsRow.Visibility = Visibility.Collapsed;
+            }
+        };
+        var weatherSearchControls = new StackPanel { Orientation = Orientation.Horizontal };
+        findWeather.Margin = new Thickness(8, 0, 0, 0);
+        weatherSearchControls.Children.Add(weatherSearch);
+        weatherSearchControls.Children.Add(findWeather);
+        if (double.IsFinite(state.WeatherLatitude) && double.IsFinite(state.WeatherLongitude))
+            _weatherStatus.Text = "Selected: " + new WeatherLocation(state.WeatherName, state.WeatherLatitude, state.WeatherLongitude).Display;
+        else _weatherStatus.Text = "Choose a location to show outdoor temperature.";
+
         var displayModeCombo = PluginUi.Combo(["Temperature", "Solid", "Gradient", "Rainbow"], state.DisplayMode, mode =>
         {
             _plugin.SetDisplayMode(mode);
@@ -98,6 +137,10 @@ internal sealed class CyberLcdSettingsView : UserControl
             PluginUi.LabelRow("Display brightness", ReadoutRow(displayBrightness, displayBrightnessValue)),
             PluginUi.LabelRow("Desk strip brightness", ReadoutRow(deskBrightness, deskBrightnessValue)),
             rescan,
+            SectionHeader("Outdoor temperature"),
+            PluginUi.LabelRow("Location", weatherSearchControls),
+            _weatherResultsRow,
+            _weatherStatus,
             sectionDisplay,
             PluginUi.LabelRow("Mode", displayModeCombo),
             _displayEditorHost,

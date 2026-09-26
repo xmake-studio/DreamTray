@@ -85,7 +85,7 @@ internal static class PluginUi
 
     public static ComboBox Combo(IEnumerable<string> items, string? selected, Action<string> onChanged)
     {
-        var combo = new ComboBox { Style = Style("FluentComboBox"), MinWidth = 120 };
+        var combo = StyledCombo();
         foreach (var item in items) combo.Items.Add(item);
         if (selected != null) combo.SelectedItem = selected;
         combo.SelectionChanged += (_, _) =>
@@ -94,6 +94,20 @@ internal static class PluginUi
         };
         return combo;
     }
+
+    public static ComboBox StyledCombo(double? width = null)
+    {
+        var combo = new ComboBox { Style = Style("FluentComboBox"), MinWidth = 120 };
+        if (width is double value) combo.Width = value;
+        return combo;
+    }
+
+    public static TextBox TextInput(string text, double width = 220) => new()
+    {
+        Text = text,
+        Style = Style("FluentTextBox"),
+        Width = width,
+    };
 
     public static Button Button(string text, Action onClick)
     {

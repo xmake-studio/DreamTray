@@ -27,19 +27,19 @@ internal static class CyberLcdFrame
     /// (same reasoning as CyberVFD's frame builder: the clock must never be stale
     /// even when a sample repeats).
     /// </summary>
-    public static string Build(SystemSnapshot s, DateTime? clock = null)
+    public static string Build(SystemSnapshot s, DateTime? clock = null, float? outdoorCelsius = null)
     {
         var now = clock ?? s.Timestamp;
         string time = now.ToString("HH:mm:ss", CultureInfo.InvariantCulture);
-        string date = now.DayOfWeek.ToString().ToUpperInvariant()
-                      + " " + now.ToString("dd/MM", CultureInfo.InvariantCulture);
+        string outdoor = outdoorCelsius is float value && float.IsFinite(value)
+            ? F(value, 1) : "-";
 
         string threads = string.Join(",", Threads(s).Select(t => F(t, 2)));
 
         float gpuCoreGHz = s.GpuClock / 1000f;
         var (disk0, disk0Label, disk1, disk1Label) = BusiestTwoDisks(s);
 
-        return "D|" + time + "|" + date
+        return "D|" + time + "|" + outdoor
             + "|" + F(s.CpuTemp, 1) + "|" + F(s.CpuClockAvg, 2) + "|" + F(s.CpuClockMax, 2)
             + "|" + F(s.CpuPower, 1)
             + "|" + F(s.RamUsedGb, 1) + "|" + F(s.RamTotalGb, 1) + "|" + F(s.SwapUsedGb, 2)
