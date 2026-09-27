@@ -179,6 +179,7 @@ public sealed class SensorService : IDisposable
         // Estimated iGPU power = APU package minus the x86 cores. This is really the
         // uncore+GPU+SoC remainder, but unlike LHM's mislabeled "GPU Core" power it
         // does NOT track CPU load (both grow together and cancel), so it's stable.
+        // ReadGpu overwrites this for a discrete GPU, never for an AMD iGPU.
         b.GpuW = MathF.Max(0, package - coreSum);
     }
 
@@ -215,8 +216,24 @@ public sealed class SensorService : IDisposable
             }
         }
         b.GpuTemp = gpuTemp;
-        b.GpuW = gpuPower;
+        // An AMD iGPU sits inside the package ReadCpu already measured, and ReadCpu
+        // has set GpuW to package-minus-cores. ADL's power sensors on an APU are not
+        // the graphics block alone -- they track CPU load too -- so letting them
+        // overwrite the estimate showed e.g. 40 W cores + 30 W GPU inside a 40 W APU.
+        if (!IsAmdIntegrated(hw)) b.GpuW = gpuPower;
     }
+
+    /// <summary>
+    /// LHM exposes no integrated/discrete flag for AMD, so this goes by the ADL
+    /// adapter name: APU graphics are named "... Graphics" ("AMD Radeon 780M
+    /// Graphics", "AMD Radeon(TM) Graphics", "... Vega 8 Graphics"), discrete cards
+    /// "AMD Radeon RX ...". The RX exclusion also covers Kaby Lake-G's on-package
+    /// "Radeon RX Vega M ... Graphics", which is a separate die with its own power.
+    /// </summary>
+    private static bool IsAmdIntegrated(IHardware hw) =>
+        hw.HardwareType == HardwareType.GpuAmd
+        && hw.Name.TrimEnd().EndsWith("Graphics", StringComparison.OrdinalIgnoreCase)
+        && !hw.Name.Contains(" RX ", StringComparison.OrdinalIgnoreCase);
 
     /// <summary>
     /// Called once per Memory node. LHM 0.9.6 split memory into *two* nodes,
