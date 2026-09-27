@@ -1,6 +1,8 @@
 using System.Runtime.InteropServices;
 using System.Windows;
 using System.Windows.Interop;
+using System.Windows.Threading;
+using DreamTray.Logging;
 
 namespace DreamTray.App.Interop;
 
@@ -42,6 +44,8 @@ internal sealed class TrayIcon : IDisposable
     private HwndSource? _source;
     private nint _iconHandle;
     private bool _added;
+    /// <summary>Retries NIM_ADD while the shell is not ready to take the icon.</summary>
+    private DispatcherTimer? _addRetry;
     private bool _light;
     /// <summary>Set between a press already acted on and the release that ends it.</summary>
     private bool _pressHandled;
@@ -99,6 +103,12 @@ internal sealed class TrayIcon : IDisposable
         };
         _source = new HwndSource(parameters);
         _source.AddHook(WndProc);
+
+        // The app runs elevated and Explorer does not, so UIPI drops Explorer's
+        // TaskbarCreated broadcast unless it is let through explicitly — and without
+        // it an icon lost to an Explorer restart, or to a logon where the task ran
+        // before the taskbar existed, never comes back.
+        ChangeWindowMessageFilterEx(_source.Handle, _taskbarCreatedMessage, MSGFLT_ALLOW, nint.Zero);
 
         Rebuild();
     }
@@ -160,12 +170,43 @@ internal sealed class TrayIcon : IDisposable
     private void Add()
     {
         var data = BuildData();
-        if (!Shell_NotifyIcon(NIM_ADD, ref data)) return;
+        if (!Shell_NotifyIcon(NIM_ADD, ref data))
+        {
+            // At logon the autostart task can beat Explorer to the taskbar. TaskbarCreated
+            // should announce it, but keep knocking as well rather than trust one message
+            // to be the only way the icon ever appears.
+            ScheduleAddRetry();
+            return;
+        }
+        StopAddRetry();
         // Version 4 gives us proper mouse messages with screen coordinates in wParam.
         Shell_NotifyIcon(NIM_SETVERSION, ref data);
         _added = true;
         // Seed the cache now, so the very first click has a rectangle to use.
         RefreshIconRectInBackground();
+    }
+
+    private void ScheduleAddRetry()
+    {
+        if (_addRetry != null) return;
+        Log.Write("tray: shell refused the icon (taskbar not ready?), retrying");
+        _addRetry = new DispatcherTimer(DispatcherPriority.Background)
+        {
+            Interval = TimeSpan.FromSeconds(1),
+        };
+        _addRetry.Tick += (_, _) =>
+        {
+            if (_source == null || _added) { StopAddRetry(); return; }
+            Add();
+            if (_added) Log.Write("tray: icon added after retry");
+        };
+        _addRetry.Start();
+    }
+
+    private void StopAddRetry()
+    {
+        _addRetry?.Stop();
+        _addRetry = null;
     }
 
     private void Modify()
@@ -373,6 +414,7 @@ internal sealed class TrayIcon : IDisposable
 
     public void Dispose()
     {
+        StopAddRetry();
         if (_added && _source != null)
         {
             var data = BuildData();
@@ -432,6 +474,11 @@ internal sealed class TrayIcon : IDisposable
 
     [DllImport("user32.dll", CharSet = CharSet.Unicode)]
     private static extern uint RegisterWindowMessage(string message);
+
+    private const uint MSGFLT_ALLOW = 1;
+
+    [DllImport("user32.dll", SetLastError = true)]
+    private static extern bool ChangeWindowMessageFilterEx(nint hwnd, uint message, uint action, nint changeInfo);
 
     /// <summary>
     /// When the message being dispatched right now was posted. The tray callback is
