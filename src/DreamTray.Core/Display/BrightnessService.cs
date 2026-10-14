@@ -17,6 +17,12 @@ namespace DreamTray.Display;
 ///
 /// Writes never block the caller: the newest value per display wins and stale
 /// intermediate values from a slider drag are dropped.
+///
+/// The level chosen for each external monitor is remembered and put back when the
+/// monitor forgets it. Many monitors treat a DDC/CI brightness as volatile and fall
+/// back to their own OSD setting on a power cycle, a wake from standby or a mode
+/// change (an exclusive-fullscreen game switching resolution or refresh rate) — so
+/// without this, the slider's work was undone by every reboot, sleep and game.
 /// </summary>
 public sealed class BrightnessService : IDisposable
 {
@@ -43,10 +49,19 @@ public sealed class BrightnessService : IDisposable
     private Thread? _worker;
     private volatile bool _stop;
 
-    public BrightnessService(Action<string> log)
+    /// <param name="remembered">
+    /// Levels saved from a previous run, by <see cref="Target.PersistKey"/>. Given
+    /// here rather than set later so the warm-up scan — the one that runs right after
+    /// a reboot — already knows what to put back.
+    /// </param>
+    public BrightnessService(Action<string> log, IReadOnlyDictionary<string, int>? remembered = null)
     {
         _log = log;
+        _remembered = remembered == null
+            ? new(StringComparer.OrdinalIgnoreCase)
+            : new(remembered, StringComparer.OrdinalIgnoreCase);
         _heal = new Timer(_ => QueueScan(null), null, Timeout.Infinite, Timeout.Infinite);
+        _restore = new Timer(_ => OnRestoreTimer(), null, Timeout.Infinite, Timeout.Infinite);
     }
 
     /// <summary>Internal record pairing a public target with its native handle.</summary>
@@ -57,6 +72,12 @@ public sealed class BrightnessService : IDisposable
         // Track ownership separately; zero is not an absence marker here.
         public bool HasDdcHandle { get; init; }
         public nint DdcHandle { get; init; }
+        /// <summary>
+        /// What the remembered level is filed under; empty for displays whose level is
+        /// not remembered (the laptop panel — Windows already keeps that one per power
+        /// source, and putting it back ourselves would fight adaptive brightness).
+        /// </summary>
+        public string PersistKey { get; init; } = "";
         /// <summary>
         /// The live <c>WmiMonitorBrightnessMethods</c> instance for the built-in
         /// panel; null for DDC monitors. Held rather than re-queried per write:
@@ -225,11 +246,7 @@ public sealed class BrightnessService : IDisposable
 
             // Everyone watching, not just whoever asked for this pass — a retry that
             // finally found a monitor is news to an open panel that requested nothing.
-            foreach (var handler in DisplaysChanged?.GetInvocationList() ?? [])
-            {
-                try { ((Action)handler)(); }
-                catch (Exception ex) { _log($"display change handler threw: {ex.Message}"); }
-            }
+            NotifyDisplaysChanged();
 
             if (!more) return;
         }
@@ -280,7 +297,7 @@ public sealed class BrightnessService : IDisposable
         }
 
         // --- external monitors (DDC/CI) ---
-        var externals = new List<(Target Probe, Monitor Monitor, int Brightness)>();
+        var externals = new List<(Target Probe, Monitor Monitor, int Brightness, bool Fresh)>();
         // Outputs that are cabled monitors — so they ought to speak DDC/CI — and did
         // not. These are what the retry ladder below is for.
         var missing = new List<string>();
@@ -329,7 +346,7 @@ public sealed class BrightnessService : IDisposable
                     lock (_gate) queued = _pending.ContainsKey(existing.Public.Id);
                     if (!queued) existing.Public.Brightness = value;
                     _loggedDrops.Remove(monitor.Device);
-                    externals.Add((existing, monitor, existing.Public.Brightness));
+                    externals.Add((existing, monitor, existing.Public.Brightness, false));
                     continue;
                 }
                 // The handle has gone stale — the monitor was re-plugged or the driver
@@ -356,31 +373,38 @@ public sealed class BrightnessService : IDisposable
             // It answered, so forget that it was ever written off: if it drops out
             // again later that is news and deserves a line of its own.
             _loggedDrops.Remove(monitor.Device);
-            externals.Add((probe, monitor, current));
+            externals.Add((probe, monitor, current, true));
         }
 
+        // Monitors this scan found rather than carried over: just plugged in, just
+        // powered on, or — on the first scan — everything, straight after a reboot.
+        // Exactly the moments a monitor has fallen back to its own OSD brightness.
+        var arrived = new List<Target>();
         // Numbering only makes sense once we know how many survived the probe: a
         // lone external monitor is just "External display", not "External display 1".
         for (int i = 0; i < externals.Count; i++)
         {
-            var (probe, monitor, current) = externals[i];
+            var (probe, monitor, current, fresh) = externals[i];
             string id = MakeId(monitor);
             string name = Describe(monitor.Description, externals.Count == 1 ? null : i + 1);
             // A carried-over monitor keeps its DisplayTarget instance, so an optimistic
             // value set by a slider that is still being dragged survives the re-scan.
             // Only a change of name forces a new one — which is what happens when the
             // number of externals crosses one and they gain or lose their numbering.
-            list.Add(new Target
+            var target = new Target
             {
                 Public = probe.Public.Id == id && probe.Public.Name == name
                     ? probe.Public
                     : new DisplayTarget(id, name, DisplayKind.External, true) { Brightness = current },
                 DdcHandle = probe.DdcHandle,
                 HasDdcHandle = true,
+                PersistKey = MakePersistKey(monitor),
                 MinDdc = probe.MinDdc,
                 MaxDdc = probe.MaxDdc,
                 UseVcp = probe.UseVcp,
-            });
+            };
+            list.Add(target);
+            if (fresh) arrived.Add(target);
         }
 
         // Publish, then release what the old list owned — under _ddcGate so the write
@@ -400,6 +424,11 @@ public sealed class BrightnessService : IDisposable
 
         _notResponding = missing.Count;
         Interlocked.Exchange(ref _lastScanTicks, DateTimeOffset.UtcNow.UtcTicks);
+
+        // Before anyone is told about the scan, so an open panel shows the restored
+        // level rather than the one the monitor fell back to.
+        foreach (var t in arrived)
+            RestoreIfDrifted(t, t.Public.Brightness, "monitor connected");
 
         // Re-scans are frequent (every display-settings event, every panel open) and
         // almost always find the same displays; only say something when it changed.
@@ -486,6 +515,16 @@ public sealed class BrightnessService : IDisposable
             ? $"ddc:{m.Handle}"
             : m.Ordinal == 0 ? $"ddc:{m.Device}" : $"ddc:{m.Device}#{m.Ordinal}";
 
+    /// <summary>
+    /// Where a monitor's remembered level is filed. The device path names the monitor
+    /// and its connector and survives a reboot; the GDI device name it falls back to
+    /// does not always (outputs get renumbered), which is why it is not the first choice.
+    /// </summary>
+    private static string MakePersistKey(Monitor m) =>
+        !string.IsNullOrEmpty(m.DevicePath) ? m.DevicePath
+        : !string.IsNullOrEmpty(m.Device) ? $"{m.Description}@{m.Device}#{m.Ordinal}"
+        : "";
+
     private static string Describe(string description, int? index) =>
         string.IsNullOrWhiteSpace(description) || description == "Generic PnP Monitor"
             ? (index is null ? "External display" : $"External display {index}")
@@ -502,27 +541,27 @@ public sealed class BrightnessService : IDisposable
         percent = Math.Clamp(percent, 0, 100);
         var t = _targets.FirstOrDefault(x => x.Public.Id == displayId);
         if (t == null) return false;
-        t.Public.Brightness = percent; // optimistic: the UI reflects it immediately
-        lock (_gate)
-        {
-            _pending[displayId] = percent;
-            EnsureWorker();
-        }
-        _wake.Set();
+        Remember([t], percent);
+        Enqueue(t, percent);
         return true;
     }
 
     public void SetAll(int percent)
     {
+        percent = Math.Clamp(percent, 0, 100);
         var targets = _targets;
+        Remember(targets, percent);
+        foreach (var t in targets) Enqueue(t, percent);
+    }
+
+    /// <summary>Hand a value to the write worker. Takes _gate; safe under _ddcGate.</summary>
+    private void Enqueue(Target t, int percent)
+    {
+        t.Public.Brightness = percent; // optimistic: the UI reflects it immediately
         lock (_gate)
         {
-            foreach (var t in targets)
-            {
-                t.Public.Brightness = Math.Clamp(percent, 0, 100);
-                _pending[t.Public.Id] = t.Public.Brightness;
-            }
-            if (targets.Count > 0) EnsureWorker();
+            _pending[t.Public.Id] = percent;
+            EnsureWorker();
         }
         _wake.Set();
     }
@@ -572,6 +611,163 @@ public sealed class BrightnessService : IDisposable
             // Monitors dislike back-to-back DDC writes; this also coalesces a drag
             // into ~10 writes/second instead of one per mouse-move event.
             Thread.Sleep(100);
+        }
+    }
+
+    // ---------------------------------------------------------------- remembering
+
+    /// <summary>
+    /// Levels the user chose, by <see cref="Target.PersistKey"/>. Copy-on-write: a
+    /// change publishes a new dictionary and never touches one already handed out,
+    /// because the settings store serialises the published one on its own thread.
+    /// </summary>
+    private volatile Dictionary<string, int> _remembered;
+    private readonly object _rememberGate = new();
+
+    /// <summary>
+    /// Raised (on the caller's thread) with the full set of remembered levels after
+    /// the user changes one. The dictionary is never modified afterwards, so it can
+    /// be stored as is.
+    /// </summary>
+    public event Action<IReadOnlyDictionary<string, int>>? RememberedChanged;
+
+    /// <summary>When false nothing is put back; levels are still remembered.</summary>
+    public bool RestoreEnabled
+    {
+        get => _restoreEnabled;
+        set => _restoreEnabled = value;
+    }
+    private volatile bool _restoreEnabled = true;
+
+    private void Remember(IEnumerable<Target> targets, int percent)
+    {
+        Dictionary<string, int> next;
+        lock (_rememberGate)
+        {
+            var current = _remembered;
+            next = current;
+            foreach (var t in targets)
+            {
+                if (t.PersistKey.Length == 0) continue;
+                if (current.TryGetValue(t.PersistKey, out int old) && old == percent) continue;
+                if (ReferenceEquals(next, current)) next = new(current, StringComparer.OrdinalIgnoreCase);
+                next[t.PersistKey] = percent;
+            }
+            if (ReferenceEquals(next, current)) return;
+            _remembered = next;
+        }
+        RememberedChanged?.Invoke(next);
+    }
+
+    // ---------------------------------------------------------------- restoring
+
+    /// <summary>
+    /// When to check again after something that makes monitors forget, counted from
+    /// the event. One write is not enough: a monitor coming out of standby or
+    /// resyncing after a mode change answers DDC/CI for a while before it is really
+    /// ready, accepts the write, and then drops back to its OSD value once it has
+    /// finished — or does not answer at all for the first second or two. So the
+    /// level is read back a few times over half a minute and re-sent while it is off.
+    /// </summary>
+    private static readonly int[] RestorePassesMs = [1_500, 4_000, 8_000, 15_000, 30_000];
+
+    private readonly Timer _restore;
+    private readonly object _restoreGate = new();
+    private int _restoreStep;
+    private int _restoreGeneration;
+    private string _restoreReason = "";
+
+    /// <summary>
+    /// Something just happened that makes monitors drop a DDC/CI brightness — a wake
+    /// from sleep, a display coming back on, a mode change. Check every remembered
+    /// monitor over the next half minute and put its level back where it slipped.
+    ///
+    /// Deliberately not done on an ordinary re-scan (a panel open): a level that
+    /// differs then is far more likely to have been set on the monitor's own buttons,
+    /// and that is the user's choice to keep until something actually resets it.
+    /// </summary>
+    public void RequestRestore(string reason)
+    {
+        lock (_restoreGate)
+        {
+            // Checked under the lock Dispose takes, so the timer cannot be rebooked
+            // after it has been disposed.
+            if (_stop) return;
+            _restoreGeneration++;
+            _restoreStep = 0;
+            _restoreReason = reason;
+            _restore.Change(RestorePassesMs[0], Timeout.Infinite);
+        }
+    }
+
+    private void OnRestoreTimer()
+    {
+        int generation, step;
+        string reason;
+        lock (_restoreGate)
+        {
+            generation = _restoreGeneration;
+            step = _restoreStep;
+            reason = _restoreReason;
+        }
+
+        bool changed = false;
+        try
+        {
+            if (_restoreEnabled && _remembered.Count > 0)
+            {
+                lock (_ddcGate)
+                {
+                    foreach (var t in _targets)
+                    {
+                        if (!t.HasDdcHandle || t.PersistKey.Length == 0) continue;
+                        if (!_remembered.ContainsKey(t.PersistKey)) continue;
+                        // A monitor still waking does not answer; the next pass asks again.
+                        int value = ReadDdcBrightness(t);
+                        if (value >= 0) changed |= RestoreIfDrifted(t, value, reason);
+                    }
+                }
+            }
+        }
+        catch (Exception ex) { _log($"brightness restore pass failed: {ex.Message}"); }
+
+        if (changed) NotifyDisplaysChanged();
+
+        lock (_restoreGate)
+        {
+            // A newer request has already rebooked the timer from its own start.
+            if (generation != _restoreGeneration || _stop) return;
+            _restoreStep = step + 1;
+            if (_restoreStep < RestorePassesMs.Length)
+                _restore.Change(RestorePassesMs[_restoreStep] - RestorePassesMs[step], Timeout.Infinite);
+        }
+    }
+
+    /// <summary>
+    /// Queue the remembered level for <paramref name="t"/> if <paramref name="current"/>
+    /// is off from it. A write already queued is the newer intent and is left alone.
+    /// </summary>
+    private bool RestoreIfDrifted(Target t, int current, string reason)
+    {
+        if (!_restoreEnabled || t.PersistKey.Length == 0) return false;
+        if (!_remembered.TryGetValue(t.PersistKey, out int wanted)) return false;
+        // The percent → raw → percent round trip through a monitor's own range can
+        // come back one off; that is not drift, and re-sending it would never settle.
+        if (Math.Abs(current - wanted) <= 1) return false;
+        lock (_gate)
+            if (_pending.ContainsKey(t.Public.Id)) return false;
+
+        _log($"brightness: {t.Public.Name} is at {current}%, restoring {wanted}% ({reason})");
+        Enqueue(t, wanted);
+        return true;
+    }
+
+    private void NotifyDisplaysChanged()
+    {
+        foreach (var handler in DisplaysChanged?.GetInvocationList() ?? [])
+        {
+            try { ((Action)handler)(); }
+            catch (Exception ex) { _log($"display change handler threw: {ex.Message}"); }
         }
     }
 
@@ -692,7 +888,7 @@ public sealed class BrightnessService : IDisposable
     /// be counted as a monitor that went missing.
     /// </summary>
     private readonly record struct Monitor(nint Handle, string Description, string Device,
-                                           int Ordinal, bool IsInternal);
+                                           int Ordinal, bool IsInternal, string DevicePath);
 
     private static List<Monitor> EnumeratePhysicalMonitors()
     {
@@ -722,7 +918,8 @@ public sealed class BrightnessService : IDisposable
                                                    : friendly,
                                                device,
                                                i,
-                                               entry.IsInternal));
+                                               entry.IsInternal,
+                                               entry.DevicePath ?? ""));
             }
             return true;
         }, nint.Zero);
@@ -833,6 +1030,8 @@ public sealed class BrightnessService : IDisposable
         _stop = true;
         _heal.Change(Timeout.Infinite, Timeout.Infinite);
         _heal.Dispose();
+        lock (_restoreGate) _restore.Change(Timeout.Infinite, Timeout.Infinite);
+        _restore.Dispose();
         _wake.Set();
         _worker?.Join(1000);
         lock (_ddcGate)

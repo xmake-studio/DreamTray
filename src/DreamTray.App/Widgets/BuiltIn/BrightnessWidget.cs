@@ -287,6 +287,15 @@ internal sealed class BrightnessWidget(IWidgetContext context) : WidgetBase(cont
         Ui.Caption("Brightness is applied to the built-in panel through the ACPI backlight " +
                    "interface and to external monitors over DDC/CI."),
         Ui.LabelRow("Move all displays together", Ui.Switch(LinkDisplays, v => LinkDisplays = v)),
+        Ui.LabelRow("Restore level after sleep, reboot and mode changes",
+            Ui.Switch(AppState.Brightness.RestoreLevels, v =>
+            {
+                AppState.Brightness.RestoreLevels = v;
+                AppState.Save();
+                AppState.ApplyBrightnessSettings();
+            })),
+        Ui.Caption("Many monitors forget a level set over DDC/CI when they power on, wake " +
+                   "or switch modes, and fall back to the one in their own menu."),
         Ui.Button("Re-scan displays", RefreshDisplays));
 
     public override void Dispose()

@@ -22,6 +22,7 @@ public sealed class AppServices : IDisposable
     public ThemeService Theme { get; }
     public SensorSampler Sensors { get; }
     public BrightnessService Brightness { get; }
+    public DisplayWakeWatcher DisplayWake { get; }
     public DisplayModeService DisplayModes { get; }
     public TdpService Tdp { get; }
     public PowerPolicyService PowerPolicy { get; }
@@ -41,7 +42,17 @@ public sealed class AppServices : IDisposable
                 ? p : ThemePreference.System,
         };
         Sensors = new SensorSampler(dispatcher, Log.Write);
-        Brightness = new BrightnessService(Log.Write);
+        var brightness = Settings.Current.Brightness ??= new BrightnessSettings();
+        brightness.Levels ??= [];
+        Brightness = new BrightnessService(Log.Write, brightness.Levels)
+        {
+            RestoreEnabled = brightness.RestoreLevels,
+        };
+        Brightness.RememberedChanged += levels =>
+        {
+            Settings.Current.Brightness.Levels = new Dictionary<string, int>(levels);
+            Settings.Save();
+        };
         DisplayModes = new DisplayModeService(Log.Write);
         // Scan displays now, in the background, so the first panel open finds both
         // lists waiting rather than paying for a WMI query and a DDC round trip per
@@ -53,6 +64,13 @@ public sealed class AppServices : IDisposable
         _displayChangeDebounce = new System.Threading.Timer(
             _ => RescanDisplays(), null, Timeout.InfiniteTimeSpan, Timeout.InfiniteTimeSpan);
         SystemEvents.DisplaySettingsChanged += OnDisplaySettingsChanged;
+        // Monitors that fell back to their own brightness on a boot, a wake or a
+        // display power-on get the user's level back. The warm-up scan covers the
+        // boot by itself; the request makes sure a monitor still settling after
+        // power-on is checked again once it has.
+        DisplayWake = new DisplayWakeWatcher(Log.Write);
+        DisplayWake.Woke += OnDisplaysWoke;
+        Brightness.RequestRestore("startup");
         Tdp = new TdpService(Log.Write);
         PowerPolicy = new PowerPolicyService(Log.Write);
         Autostart = new AutostartService(Log.Write);
@@ -146,12 +164,29 @@ public sealed class AppServices : IDisposable
     {
         DisplayModes.RefreshAsync();
         Brightness.RefreshAsync();
+        // A mode change — an exclusive-fullscreen game switching resolution or
+        // refresh rate, an HDR toggle — makes many monitors resync and drop a
+        // brightness that was set over DDC/CI.
+        Brightness.RequestRestore("display mode change");
     }
+
+    private void OnDisplaysWoke(string reason)
+    {
+        // A handle opened before the sleep may be dead now; the scan replaces it.
+        Brightness.RefreshAsync();
+        Brightness.RequestRestore(reason);
+    }
+
+    /// <summary>Push the persisted brightness policy into the service. Call after editing it.</summary>
+    public void ApplyBrightnessSettings() =>
+        Brightness.RestoreEnabled = Settings.Current.Brightness.RestoreLevels;
 
     public void Dispose()
     {
         SystemEvents.DisplaySettingsChanged -= OnDisplaySettingsChanged;
         _displayChangeDebounce.Dispose();
+        DisplayWake.Woke -= OnDisplaysWoke;
+        DisplayWake.Dispose();
         Plugins.Dispose();
         Sensors.Dispose();
         Brightness.Dispose();

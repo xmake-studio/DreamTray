@@ -20,6 +20,8 @@ public sealed class AppSettings
 
     public TdpSettings Tdp { get; set; } = new();
 
+    public BrightnessSettings Brightness { get; set; } = new();
+
     public AnimationSettings Animations { get; set; } = new();
 
     /// <summary>Widgets on the panel, in display order.</summary>
@@ -79,6 +81,23 @@ public sealed class TdpSettings
     /// later probe.
     /// </summary>
     public bool RangeAutoDetected { get; set; } = true;
+}
+
+public sealed class BrightnessSettings
+{
+    /// <summary>
+    /// Put each external monitor's level back after a reboot, a wake from sleep, the
+    /// display powering on, or a mode change — the moments monitors fall back to the
+    /// brightness stored in their own menu.
+    /// </summary>
+    public bool RestoreLevels { get; set; } = true;
+
+    /// <summary>
+    /// Last level set per external monitor, 0..100, keyed by the monitor's device
+    /// path. Replaced wholesale on every change, never edited in place, because the
+    /// save runs on a timer thread.
+    /// </summary>
+    public Dictionary<string, int> Levels { get; set; } = [];
 }
 
 /// <summary>One widget placed on the panel.</summary>
