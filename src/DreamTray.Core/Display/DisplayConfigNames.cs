@@ -15,7 +15,12 @@ namespace DreamTray.Display;
 /// </summary>
 internal static class DisplayConfigNames
 {
-    internal readonly record struct Entry(string FriendlyName, bool IsInternal);
+    /// <param name="DevicePath">
+    /// The monitor's PnP interface path (<c>\\?\DISPLAY#MSI3CA9#5&amp;…#{…}</c>). Unlike the GDI
+    /// device name, which can be handed to a different monitor after a reboot or a
+    /// re-plug, this names the monitor itself — EDID id plus the connector it sits on.
+    /// </param>
+    internal readonly record struct Entry(string FriendlyName, bool IsInternal, string DevicePath = "");
 
     /// <summary>Empty when the CCD API is unavailable or reports nothing usable.</summary>
     public static Dictionary<string, Entry> Query()
@@ -68,7 +73,8 @@ internal static class DisplayConfigNames
 
             // The friendly name is only present when the flag says the EDID had one.
             string name = (target.flags & 0x1) != 0 ? target.monitorFriendlyDeviceName : "";
-            result[source.viewGdiDeviceName] = new Entry(name ?? "", isInternal);
+            result[source.viewGdiDeviceName] = new Entry(name ?? "", isInternal,
+                                                         target.monitorDevicePath ?? "");
         }
 
         return result;

@@ -22,6 +22,13 @@ internal static class AppState
     /// <summary>APU power-limit policy — shared with the Settings window.</summary>
     public static TdpSettings Tdp => _services?.Settings.Current.Tdp ?? new TdpSettings();
 
+    /// <summary>Brightness restore policy — applies with or without the widget on the panel.</summary>
+    public static BrightnessSettings Brightness =>
+        _services?.Settings.Current.Brightness ?? new BrightnessSettings();
+
+    /// <summary>Push a changed brightness policy into the live service.</summary>
+    public static void ApplyBrightnessSettings() => _services?.ApplyBrightnessSettings();
+
     public static void Save() => _services?.Settings.Save();
 
     /// <summary>Push a changed TDP policy into the live service.</summary>

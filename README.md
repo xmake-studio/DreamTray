@@ -55,7 +55,7 @@ and wasn't detected.
 
 | Widget | What it does |
 |---|---|
-| Brightness | One slider per display. Built-in panel via the ACPI backlight interface, external monitors via DDC/CI. Optional "move all together". |
+| Brightness | One slider per display. Built-in panel via the ACPI backlight interface, external monitors via DDC/CI. Optional "move all together". The level set for each external monitor is remembered and put back after a reboot, a wake from sleep, the display powering on, or a mode change (e.g. a fullscreen game), when monitors tend to fall back to their own OSD value. |
 | APU power limit | Sustained TDP slider showing live system and APU draw underneath. The range is detected from your own silicon. Settings: re-apply interval and, on a laptop, separate charger/battery defaults. |
 | Dark theme | Flips the **Windows** light/dark setting. On a laptop, optionally go light on battery and back to dark on the charger. |
 | Battery *(laptops only)* | Charge level, power source, time to empty or full. |
@@ -183,7 +183,8 @@ src/
   DreamTray.Contracts/   The plugin ABI: interfaces + plain data, nothing else.
   DreamTray.Core/        Hardware access, settings, plugin loader. No app UI.
     Sensors/             SensorService (LHM) + PDH/NT readers + SensorSampler.
-    Display/             BrightnessService (WMI + DDC/CI), DisplayModeService.
+    Display/             BrightnessService (WMI + DDC/CI), DisplayModeService,
+                         DisplayWakeWatcher (resume / unlock / display-on events).
     Power/               PawnIO/SMU interop, TdpService (limit + policy),
                          PowerPolicyService (standby timeout, lid action).
     Theme/               Windows theme tracking and switching.
