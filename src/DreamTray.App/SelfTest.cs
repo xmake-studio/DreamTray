@@ -153,58 +153,42 @@ internal static class SelfTest
                     $"widget count drifted: {before} before, {manager.Instances.Count} after");
         });
 
-        Check("dismissal during an open is held, not obeyed", () =>
+        Check("open and close only cloak, never hide", () =>
         {
             if (panel == null) throw new InvalidOperationException("no panel to exercise");
 
-            // The failure this pins down, because it has come back more than once.
-            // Between the tray click and the panel appearing, the window is shown,
-            // active and cloaked: there is nothing on screen, but every mechanism that
-            // dismisses windows already treats it as open. A queued click, or a
-            // deactivation from the shell trading focus during the open, therefore
-            // hides a panel the user has never seen — and leaves the rest of the open
-            // running against a window that is no longer there. What the user reports
-            // is that the panel does not open at all, however many times they click.
-            //
-            // So a dismissal that arrives mid-open has to keep until the panel is up,
-            // and then be acted on. Both halves are checked here: held, then applied.
+            // What makes an open instant is that it has nothing to do: the window was
+            // shown, laid out and composed long before, and only its cloak changes.
+            // A close that hid the window instead would hand the next open the whole
+            // cost of showing it again — the slow open, back by the side door — and
+            // nothing on screen would say so. Both settings, because they take
+            // different routes out: the animated close cloaks at the end of a slide.
             var animations = services.Settings.Current.Animations;
             bool configured = animations.Enabled;
             try
             {
-                // Both settings, because they take different routes out of the reveal
-                // and the animated one is the default. Neither may put a frame of the
-                // panel on screen: it is dismissed before it is ever uncloaked, so a
-                // pass of this test must be invisible to whoever is running it.
                 foreach (bool animated in new[] { false, true })
                 {
                     animations.Enabled = animated;
                     string with = animated ? "with animation" : "without animation";
 
                     panel.ShowNear(Rect.Empty);
-                    if (!panel.IsOpening)
-                        throw new InvalidOperationException(
-                            $"the panel did not report an open in flight ({with})");
+                    if (!panel.IsOpen || panel.IsCloaked)
+                        throw new InvalidOperationException($"the panel did not come up uncloaked ({with})");
 
-                    panel.HidePanel();
-                    if (!panel.IsVisible)
-                        throw new InvalidOperationException(
-                            $"a dismissal mid-open tore the open down instead of waiting ({with})");
-
-                    // And a second open landing on the first must not start one on top
-                    // of it — that is the same click arriving by the other route.
+                    // A second open landing on the first is the same click arriving by
+                    // another route, and must change nothing.
                     panel.ShowNear(Rect.Empty);
 
-                    Pump(() => !panel.IsOpening, 2000);
-                    if (panel.IsOpening)
-                        throw new InvalidOperationException(
-                            $"the open never finished — no frame and no watchdog ({with})");
+                    panel.HidePanel();
+                    Pump(() => !panel.IsClosing, 2000);
                     if (panel.IsClosing)
+                        throw new InvalidOperationException($"the exit never finished ({with})");
+                    if (panel.IsOpen || !panel.IsCloaked)
+                        throw new InvalidOperationException($"the closed panel was left on screen ({with})");
+                    if (!panel.IsVisible)
                         throw new InvalidOperationException(
-                            $"the panel played an exit it was never on screen for ({with})");
-                    if (panel.IsVisible)
-                        throw new InvalidOperationException(
-                            $"the held dismissal was dropped rather than applied ({with})");
+                            $"the close hid the window instead of cloaking it ({with})");
                 }
             }
             finally
@@ -265,8 +249,8 @@ internal static class SelfTest
     /// <summary>
     /// Let the dispatcher run until <paramref name="until"/> holds, or the budget is
     /// spent. The self-test drives the UI thread itself, so anything that finishes on
-    /// a rendered frame or a timer — the panel's reveal is both — never happens unless
-    /// the thread is handed back for a while.
+    /// a rendered frame — the panel's animated close does — never happens unless the
+    /// thread is handed back for a while.
     /// </summary>
     private static void Pump(Func<bool> until, int budgetMs)
     {

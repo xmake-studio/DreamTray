@@ -18,7 +18,11 @@ internal static class WindowEffects
     private const int DWMWA_USE_IMMERSIVE_DARK_MODE = 20;
     private const int DWMWA_WINDOW_CORNER_PREFERENCE = 33;
     private const int DWMWA_CLOAK = 13;
+    private const int DWMWA_CLOAKED = 14;
     private const int DWMWA_SYSTEMBACKDROP_TYPE = 38;
+
+    private const int DWM_CLOAKED_SHELL = 0x2;
+    private const int DWM_CLOAKED_INHERITED = 0x4;
 
     private const int DWMWCP_DONOTROUND = 1;
     private const int DWMWCP_ROUND = 2;
@@ -280,27 +284,108 @@ internal static class WindowEffects
 
     /// <summary>
     /// Hide a window from the screen while leaving it fully live: still visible to
-    /// the window manager, still laid out, still painting. This is what the shell
-    /// uses for windows on other virtual desktops, and it is the only way to let a
-    /// window compose a complete frame at a position the user must not see it in.
+    /// the window manager, still laid out, still painting, its last frame still held
+    /// by the compositor. This is what the shell uses for windows on other virtual
+    /// desktops. A cloaked window is not hit-tested either, so one left in place
+    /// takes no clicks meant for whatever is behind it.
     /// </summary>
     public static void SetCloaked(Window window, bool cloaked) =>
         SetCloaked(new WindowInteropHelper(window).Handle, cloaked);
 
-    /// <summary>
-    /// As above, for a handle the caller has already cached.
-    ///
-    /// This overload exists so a window can be uncloaked from a thread that is not
-    /// the UI thread: <c>WindowInteropHelper</c> touches the <see cref="Window"/>,
-    /// which has thread affinity, whereas an HWND and a DWM attribute write do not.
-    /// That is what lets the reveal watchdog get the panel on screen even when the
-    /// dispatcher is the thing that is stuck — see PanelWindow.OnRevealWatchdog.
-    /// </summary>
+    /// <summary>As above, for a handle the caller has already cached.</summary>
     public static void SetCloaked(nint hwnd, bool cloaked)
     {
         if (hwnd == nint.Zero) return;
         int value = cloaked ? 1 : 0;
         DwmSetWindowAttribute(hwnd, DWMWA_CLOAK, ref value, sizeof(int));
+    }
+
+    /// <summary>
+    /// Whether something other than this app is keeping the window off the screen —
+    /// the shell, which cloaks every window that belongs to a virtual desktop other
+    /// than the current one. Our own cloak cannot lift that, so a window that finds
+    /// itself in this state has to be shown again from scratch to be adopted by the
+    /// desktop the user is on.
+    /// </summary>
+    public static bool IsCloakedByShell(nint hwnd)
+    {
+        if (hwnd == nint.Zero) return false;
+        if (DwmGetWindowAttribute(hwnd, DWMWA_CLOAKED, out int reason, sizeof(int)) != 0) return false;
+        return (reason & (DWM_CLOAKED_SHELL | DWM_CLOAKED_INHERITED)) != 0;
+    }
+
+    /// <summary>
+    /// Mark a window as a tool window: never on the taskbar or in Alt+Tab, and — the
+    /// part that matters for a window that stays shown — not owned by any one virtual
+    /// desktop, so it is on whichever one the user has switched to.
+    /// </summary>
+    public static void SetToolWindow(nint hwnd) => SetExStyle(hwnd, WS_EX_TOOLWINDOW, true);
+
+    /// <summary>
+    /// Whether the window manager may give this window the foreground on its own —
+    /// when it is clicked, or when the window above it closes. Switched off for a
+    /// window that is shown but cloaked, which must never end up with keyboard focus
+    /// the user cannot see.
+    /// </summary>
+    public static void SetActivatable(nint hwnd, bool activatable) =>
+        SetExStyle(hwnd, WS_EX_NOACTIVATE, !activatable);
+
+    private static void SetExStyle(nint hwnd, long bit, bool on)
+    {
+        if (hwnd == nint.Zero) return;
+        long style = GetWindowLongPtr(hwnd, GWL_EXSTYLE);
+        long wanted = on ? style | bit : style & ~bit;
+        if (wanted != style) SetWindowLongPtr(hwnd, GWL_EXSTYLE, (nint)wanted);
+    }
+
+    /// <summary>Raise a window to the top of its band without activating it.</summary>
+    public static void BringToFront(nint hwnd)
+    {
+        if (hwnd == nint.Zero) return;
+        SetWindowPos(hwnd, HWND_TOP, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+
+    /// <summary>Drop a window to the bottom of the z-order without activating anything.</summary>
+    public static void SendToBack(nint hwnd)
+    {
+        if (hwnd == nint.Zero) return;
+        SetWindowPos(hwnd, HWND_BOTTOM, 0, 0, 0, 0,
+            SWP_NOMOVE | SWP_NOSIZE | SWP_NOACTIVATE | SWP_NOOWNERZORDER);
+    }
+
+    /// <summary>
+    /// Give the foreground to the window the user would land on if this one had been
+    /// hidden: the next one down the z-order that can actually take it. Hiding a
+    /// window makes the window manager do this by itself; cloaking one does not, and
+    /// without it the keyboard would stay with a panel nobody can see.
+    /// </summary>
+    public static void ActivateWindowBelow(nint hwnd)
+    {
+        if (hwnd == nint.Zero) return;
+        for (nint next = GetWindow(hwnd, GW_HWNDNEXT); next != nint.Zero; next = GetWindow(next, GW_HWNDNEXT))
+        {
+            if (!IsWindowVisible(next) || IsIconic(next) || !IsWindowEnabled(next)) continue;
+            long ex = GetWindowLongPtr(next, GWL_EXSTYLE);
+            if ((ex & (WS_EX_TOOLWINDOW | WS_EX_NOACTIVATE)) != 0) continue;
+            if (DwmGetWindowAttribute(next, DWMWA_CLOAKED, out int cloaked, sizeof(int)) == 0 && cloaked != 0)
+                continue;
+            if (!GetWindowRect(next, out RECT r) || r.right <= r.left || r.bottom <= r.top) continue;
+            SetForegroundWindow(next);
+            return;
+        }
+    }
+
+    /// <summary>
+    /// Block until the compositor has taken every surface update already handed to
+    /// it — for WPF, the frame its render thread has just presented. At most one
+    /// composition interval.
+    /// </summary>
+    public static void WaitForComposition()
+    {
+        try { DwmFlush(); }
+        catch (DllNotFoundException) { }
+        catch (EntryPointNotFoundException) { }
     }
 
     /// <summary>Scale factor of the monitor a window is on (1.0 at 96 DPI).</summary>
@@ -405,10 +490,19 @@ internal static class WindowEffects
     private const int MDT_EFFECTIVE_DPI = 0;
 
     private const int SWP_NOSIZE = 0x0001;
+    private const int SWP_NOMOVE = 0x0002;
     private const int SWP_NOZORDER = 0x0004;
     private const int SWP_NOACTIVATE = 0x0010;
     private const int SWP_NOOWNERZORDER = 0x0200;
     private const int SWP_NOSENDCHANGING = 0x0400;
+
+    private static readonly nint HWND_TOP = 0;
+    private static readonly nint HWND_BOTTOM = 1;
+
+    private const int GWL_EXSTYLE = -20;
+    private const long WS_EX_TOOLWINDOW = 0x00000080;
+    private const long WS_EX_NOACTIVATE = 0x08000000;
+    private const int GW_HWNDNEXT = 2;
 
     [StructLayout(LayoutKind.Sequential)]
     private struct MARGINS { public int Left, Right, Top, Bottom; }
@@ -440,7 +534,34 @@ internal static class WindowEffects
     private static extern int DwmSetWindowAttribute(nint hwnd, int attribute, ref int value, int size);
 
     [DllImport("dwmapi.dll")]
+    private static extern int DwmGetWindowAttribute(nint hwnd, int attribute, out int value, int size);
+
+    [DllImport("dwmapi.dll")]
+    private static extern int DwmFlush();
+
+    [DllImport("dwmapi.dll")]
     private static extern int DwmExtendFrameIntoClientArea(nint hwnd, ref MARGINS margins);
+
+    [DllImport("user32.dll", EntryPoint = "GetWindowLongPtrW")]
+    private static extern long GetWindowLongPtr(nint hwnd, int index);
+
+    [DllImport("user32.dll", EntryPoint = "SetWindowLongPtrW")]
+    private static extern nint SetWindowLongPtr(nint hwnd, int index, nint value);
+
+    [DllImport("user32.dll")]
+    private static extern nint GetWindow(nint hwnd, int command);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowVisible(nint hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsWindowEnabled(nint hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool IsIconic(nint hwnd);
+
+    [DllImport("user32.dll")]
+    private static extern bool SetForegroundWindow(nint hwnd);
 
     [DllImport("user32.dll")]
     private static extern nint MonitorFromPoint(POINT pt, int flags);

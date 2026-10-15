@@ -56,7 +56,12 @@ public partial class App : Application
         // fight the first over all three. The self-test takes no exclusive resources,
         // so it is allowed to run alongside a live instance.
         bool selfTest = e.Args.Contains("--selftest");
-        if (!selfTest)
+        // `--isolated` runs a full tray instance beside a live one, for measuring the
+        // panel against the user's own: no single-instance lock, and no plugins,
+        // because those own serial ports the live instance already holds. Pair it with
+        // DREAMTRAY_HOME so the two do not share a settings file or a log.
+        bool isolated = e.Args.Contains("--isolated");
+        if (!selfTest && !isolated)
         {
             _singleInstance = new Mutex(initiallyOwned: true, "DreamTray.SingleInstance", out bool first);
             if (!first)
@@ -97,11 +102,15 @@ public partial class App : Application
         // Plugins come up after the tray so a slow plugin never delays the icon.
         Dispatcher.BeginInvoke(DispatcherPriority.ApplicationIdle, () =>
         {
-            _services.Plugins.LoadAll();
+            if (!isolated) _services.Plugins.LoadAll();
             _services.RestoreTdpOnStartup();
             // After the plugins, so plugin widgets are part of the panel that gets
             // built — and so nothing here delays the tray icon appearing.
             _tray.Prewarm();
+            // Once everything the panel needs has been touched, keep it in memory:
+            // otherwise the hours the panel spends closed are hours of it being paged
+            // out, and the next open reads it back from disk.
+            ProcessTuning.KeepResident(Log.Write);
             Log.Write("startup complete");
         });
     }

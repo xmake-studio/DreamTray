@@ -586,7 +586,10 @@ public sealed class BrightnessService : IDisposable
 
             if (batch.Length == 0)
             {
-                _wake.WaitOne(1000);
+                // No timeout: every Enqueue and Dispose sets the event, and the event
+                // keeps a set that lands before this wait. A timed wait here only woke
+                // the thread once a second, all day, to find the queue still empty.
+                _wake.WaitOne();
                 continue;
             }
 

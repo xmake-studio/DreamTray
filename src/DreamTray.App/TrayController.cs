@@ -9,9 +9,9 @@ namespace DreamTray.App;
 /// Wires the tray icon to the panel and the context menu, and keeps the icon's
 /// colour and tooltip in step with the system.
 ///
-/// The panel window is created once and hidden rather than closed, so opening it
-/// is instant and widgets keep their state; widgets are told about visibility so
-/// they can drop their sensor subscriptions while hidden.
+/// The panel window is created once, at idle, and only ever cloaked and uncloaked
+/// after that, so opening it is instant and widgets keep their state; widgets are
+/// told about visibility so they can drop their sensor subscriptions while closed.
 /// </summary>
 internal sealed class TrayController : IDisposable
 {
@@ -45,14 +45,13 @@ internal sealed class TrayController : IDisposable
     /// Throw the panel away and build a fresh one whenever the display configuration
     /// changes.
     ///
-    /// The panel is created once and hidden rather than closed, which is what makes
-    /// opening it instant — and which is also why it cannot survive this. WPF caches
-    /// the monitor scale per window and refreshes it only from WM_DPICHANGED, and
-    /// Windows does not send WM_DPICHANGED to hidden windows. A resolution change made
-    /// while the panel is closed therefore leaves the window permanently convinced of
-    /// the old scale, and every dimension it computes scaled by the ratio of the two.
-    /// There is no API for correcting that cache; a new window is the fix, and it is
-    /// cheap here because it happens at idle rather than under a click.
+    /// The panel is created once and kept, which is what makes opening it instant —
+    /// and which is also why it is safer rebuilt than trusted through this. WPF
+    /// caches the monitor scale per window and refreshes it only from WM_DPICHANGED,
+    /// the monitor and work area the panel was placed against may be gone, and every
+    /// dimension it computes depends on both. There is no API for correcting WPF's
+    /// cache; a new window is the fix, and it is cheap here because it happens at
+    /// idle rather than under a click.
     ///
     /// Raised on a system thread, so everything real happens back on the dispatcher.
     /// </summary>
@@ -72,8 +71,8 @@ internal sealed class TrayController : IDisposable
     /// </summary>
     private void RebuildPanel(string reason)
     {
-        if (_panel == null || !_panel.HasWindowHandle) return;
-        if (_panel.IsVisible)
+        if (_panel == null) return;
+        if (_panel.IsOpen || _panel.IsClosing)
         {
             Logging.Log.Write($"panel rebuild deferred ({reason}): panel is on screen");
             return;
@@ -92,28 +91,14 @@ internal sealed class TrayController : IDisposable
     /// icon takes focus (see DismissedByCaller), so this is the only thing that
     /// toggles it and there is no second dismissal to disambiguate.
     ///
-    /// IsClosing, not just IsVisible: a panel playing its exit is on its way out and
-    /// counts as closed, so a click during the animation turns it straight back
-    /// round rather than being absorbed.
-    ///
-    /// IsOpening is the other end of the same idea, and the one that matters on a
-    /// machine where opening takes long enough to notice. Between the click and the
-    /// panel appearing the window is already IsVisible — shown, active, and cloaked —
-    /// so a toggle reads it as open and closes it. But the user has not seen
-    /// anything: their second click means "I asked for the panel", not "take it
-    /// away", and answering it with a dismissal is what turns a slow open into no
-    /// open at all, for as many clicks as they care to make. The open is already on
-    /// its way and bounded by the reveal watchdog, so the click has nothing to add.
+    /// A panel playing its exit is not IsOpen: it is on its way out and counts as
+    /// closed, so a click during the animation turns it straight back round rather
+    /// than being absorbed.
     /// </summary>
     private void TogglePanel()
     {
-        if (_panel is { IsOpening: true })
-        {
-            Logging.Log.Write("tray click ignored: the panel is already on its way to the screen");
-            return;
-        }
-        if (_panel is { IsVisible: true, IsClosing: false }) _panel.HidePanel();
-        else ShowPanel();
+        if (_panel is { IsOpen: true }) _panel.HidePanel();
+        else ShowPanel($"queue {_icon?.LastClickQueuedMs ?? 0}, ");
     }
 
     /// <summary>
@@ -138,20 +123,11 @@ internal sealed class TrayController : IDisposable
     [System.Runtime.InteropServices.DllImport("user32.dll")]
     private static extern short GetAsyncKeyState(int vKey);
 
-    public void ShowPanel()
-    {
-        // An open that has not reached the screen yet must not be started again on
-        // top of itself. Everything below assumes a settled window: the DPI check can
-        // close and rebuild it, and ShowNear places, sizes and reveals it. Running a
-        // second pass through that from inside the first — which is where a re-entered
-        // click arrives — leaves the two to finish against each other, and the panel
-        // wherever the loser left it.
-        if (_panel is { IsOpening: true })
-        {
-            Logging.Log.Write("panel open ignored: the previous one has not reached the screen yet");
-            return;
-        }
+    public void ShowPanel() => ShowPanel("");
 
+    /// <param name="trace">What the caller already knows about this open, for the log line.</param>
+    private void ShowPanel(string trace)
+    {
         var clock = System.Diagnostics.Stopwatch.StartNew();
 
         // A trim from the last close may still be pending. Collecting now, on the way
@@ -180,7 +156,7 @@ internal sealed class TrayController : IDisposable
             _panel.DismissedByCaller = PointerOverIcon;
             built = true;
         }
-        long afterBuild = clock.ElapsedMilliseconds;
+        double afterBuild = clock.Elapsed.TotalMilliseconds;
 
         // Where the icon was as of the last time the shell was asked — during hover,
         // at registration, or after the previous open. Asking it *here* is a blocking
@@ -194,14 +170,12 @@ internal sealed class TrayController : IDisposable
         // guess. It costs one slow open, once.
         var iconRect = _icon?.CachedIconRect ?? Rect.Empty;
         if (iconRect.IsEmpty) iconRect = _icon?.GetIconRect() ?? Rect.Empty;
-        long afterRect = clock.ElapsedMilliseconds;
+        double afterRect = clock.Elapsed.TotalMilliseconds;
 
-        // The panel finishes the trace and writes it, because the open is not over
-        // when this call returns: the window is still cloaked at that point and only
-        // becomes visible a frame or two later.
+        // The panel finishes the trace and writes it, with its own phases added.
         _panel.ShowNear(
             iconRect,
-            $"build {afterBuild}{(built ? "" : " cached")}, iconrect {afterRect - afterBuild}");
+            $"{trace}build {afterBuild:F1}{(built ? "" : " cached")}, iconrect {afterRect - afterBuild:F1}");
 
         // Now that the panel is up, find out where the icon actually is, for the next
         // open. Off-thread, because this is the call that was on the click path.
@@ -209,16 +183,21 @@ internal sealed class TrayController : IDisposable
     }
 
     /// <summary>
-    /// Build the panel before the user asks for it.
+    /// Build the panel before the user asks for it, and put it on the desktop
+    /// cloaked, where it stays.
     ///
     /// The window is created once and reused, so the cost of building it — the
-    /// widgets, their views, the first pass over the WPF resource dictionaries, and
-    /// the JIT for all of it — lands entirely on whichever click happens to be the
-    /// first. That is the one open that is reliably slow. Doing it at idle after
-    /// startup moves the cost to a moment when nobody is waiting.
+    /// widgets, their views, the first pass over the WPF resource dictionaries, the
+    /// JIT for all of it, and the window manager, layout and render passes of showing
+    /// it — would otherwise land on whichever click happens to be the first. Doing it
+    /// at idle after startup moves the cost to a moment when nobody is waiting, and
+    /// leaves every open after it nothing to do but uncloak.
     /// </summary>
-    public void Prewarm() =>
+    public void Prewarm()
+    {
         _panel ??= new PanelWindow(_services, OpenSettings) { DismissedByCaller = PointerOverIcon };
+        _panel.Realize(_icon?.CachedIconRect ?? Rect.Empty);
+    }
 
     public void OpenSettings()
     {

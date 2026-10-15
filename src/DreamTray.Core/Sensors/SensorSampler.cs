@@ -101,7 +101,7 @@ public sealed class SensorSampler : IDisposable
             {
                 if (_service == null)
                 {
-                    _service = new SensorService();
+                    _service = new SensorService(_log);
                     _service.Read(); // prime the delta-based readers
                     // The first real sample needs a gap after priming; fall through to
                     // the wait below and read on the next pass.

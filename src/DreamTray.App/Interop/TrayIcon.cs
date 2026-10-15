@@ -59,6 +59,14 @@ internal sealed class TrayIcon : IDisposable
     private bool _anyClickHandled;
 
     /// <summary>
+    /// How long the click being acted on waited between the shell posting it and this
+    /// app getting to it, in milliseconds — the part of an open that happens before
+    /// any of this app's code runs, and so the part no trace of the open itself can
+    /// see. Tick-count resolution, so only good for telling "none" from "a lot".
+    /// </summary>
+    public int LastClickQueuedMs { get; private set; }
+
+    /// <summary>
     /// Last rectangle the shell gave us, and when. See <see cref="CachedIconRect"/>.
     ///
     /// One immutable object rather than a Rect and a timestamp side by side, because
@@ -343,6 +351,7 @@ internal sealed class TrayIcon : IDisposable
         // it would otherwise find the mark still on the click before this one.
         _anyClickHandled = true;
         _lastClickHandledAt = Environment.TickCount;
+        LastClickQueuedMs = Math.Max(0, unchecked(_lastClickHandledAt - postedAt));
         try { Activated?.Invoke(); }
         finally { _lastClickHandledAt = Environment.TickCount; }
     }

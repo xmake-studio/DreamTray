@@ -13,11 +13,26 @@ namespace DreamTray.Sensors;
 /// costs nothing while <see cref="Read"/> is not called — so
 /// <see cref="SensorSampler"/> creates it lazily and disposes it when the last
 /// subscriber goes away.
+///
+/// A read happens once a second for as long as anything is subscribed, which with a
+/// streaming plugin is all day, so what it costs is the app's whole background cost.
+/// Two LHM nodes are therefore not refreshed by LHM: an NVIDIA GPU, which
+/// <see cref="NvidiaReader"/> reads for a hundredth of the price, and a CPU node
+/// that turns out to have no temperature or power to give (no PawnIO driver), which
+/// would otherwise migrate this thread across every core each second for nothing.
 /// </summary>
 public sealed class SensorService : IDisposable
 {
     private readonly Computer _computer;
-    private readonly UpdateVisitor _visitor = new();
+    private readonly UpdateVisitor _visitor;
+    private readonly Action<string>? _log;
+    private NvidiaReader? _nvidia;
+    /// <summary>
+    /// Reads in a row in which the CPU node had no temperature and no power, and
+    /// whether that has gone on long enough to stop refreshing it. See ReadCpuNode.
+    /// </summary>
+    private int _emptyCpuReads;
+    private bool _cpuNodeIdle;
     private readonly CpuLoadReader _cpuLoad = new();
     private readonly CpuFreqReader _cpuFreq = new();
     private readonly DiskLoadReader _diskLoad = new();
@@ -25,8 +40,10 @@ public sealed class SensorService : IDisposable
     private readonly PagefileReader _pagefile = new();
     private readonly float[] _threads;
 
-    public SensorService()
+    public SensorService(Action<string>? log = null)
     {
+        _log = log;
+        _visitor = new UpdateVisitor(IsReadElsewhere);
         _threads = new float[_cpuLoad.CoreCount];
         _computer = new Computer
         {
@@ -38,7 +55,17 @@ public sealed class SensorService : IDisposable
             IsBatteryEnabled = true,
         };
         _computer.Open();
+        _nvidia = NvidiaReader.TryOpen();
+        if (_nvidia != null) _log?.Invoke("sensors: NVIDIA GPU read directly through NVML");
     }
+
+    /// <summary>The LHM nodes the visitor leaves alone, because nothing reads them from LHM.</summary>
+    private bool IsReadElsewhere(IHardware hw) => hw.HardwareType switch
+    {
+        HardwareType.GpuNvidia => _nvidia != null,
+        HardwareType.Cpu => _cpuNodeIdle,
+        _ => false,
+    };
 
     public SystemSnapshot Read()
     {
@@ -62,7 +89,8 @@ public sealed class SensorService : IDisposable
         {
             switch (hw.HardwareType)
             {
-                case HardwareType.Cpu: ReadCpu(hw, b); break;
+                case HardwareType.Cpu: ReadCpuNode(hw, b); break;
+                case HardwareType.GpuNvidia when _nvidia != null: ReadNvidia(hw, b); break;
                 case HardwareType.GpuAmd:
                 case HardwareType.GpuNvidia:
                 case HardwareType.GpuIntel: ReadGpu(hw, b); break;
@@ -147,14 +175,60 @@ public sealed class SensorService : IDisposable
         }
     }
 
-    private static void ReadCpu(IHardware hw, Builder b)
+    /// <summary>
+    /// The CPU node, for as long as it has something to say. Without PawnIO it has
+    /// no temperature and no power to report — every such sensor stays null or zero
+    /// — and refreshing it still walks this thread across every core to try. Three
+    /// empty reads in a row (the power sensors are deltas, so the first is always
+    /// zero) settle it for the life of this service; LHM decides what it can reach
+    /// when the service is created, so nothing would change before then anyway.
+    /// </summary>
+    private void ReadCpuNode(IHardware hw, Builder b)
+    {
+        if (_cpuNodeIdle) return;
+        if (ReadCpu(hw, b))
+        {
+            _emptyCpuReads = 0;
+            return;
+        }
+        if (++_emptyCpuReads < 3) return;
+        _cpuNodeIdle = true;
+        _log?.Invoke("sensors: the CPU reports no temperature or power here (no PawnIO driver?) — no longer polling it");
+    }
+
+    /// <summary>The NVIDIA GPU through NVML, or back to LHM's node if it stops answering.</summary>
+    private void ReadNvidia(IHardware hw, Builder b)
+    {
+        if (_nvidia!.TryRead(out var r))
+        {
+            b.GpuLoad = r.Load;
+            b.GpuTemp = r.Temperature;
+            b.GpuW = r.PowerW;
+            b.GpuClock = r.ClockMhz;
+            b.VramUsed = r.VramUsedGb;
+            b.VramTotal = r.VramTotalGb;
+            return;
+        }
+        _log?.Invoke("sensors: direct NVIDIA read failed — handing the GPU back to LibreHardwareMonitor");
+        _nvidia.Dispose();
+        _nvidia = null;
+        // The visitor skipped this node on the way in; bring it up to date now so
+        // this tick still has GPU values.
+        hw.Accept(_visitor);
+        ReadGpu(hw, b);
+    }
+
+    /// <summary>Returns whether the node reported any temperature or power at all.</summary>
+    private static bool ReadCpu(IHardware hw, Builder b)
     {
         float bestTemp = 0; bool haveTemp = false;
         float package = 0, coreSum = 0;
+        bool reported = false;
         foreach (var sen in hw.Sensors)
         {
             if (!sen.Value.HasValue || float.IsNaN(sen.Value.Value)) continue;
             float v = sen.Value.Value;
+            if (v > 0 && sen.SensorType is SensorType.Temperature or SensorType.Power) reported = true;
             switch (sen.SensorType)
             {
                 case SensorType.Temperature:
@@ -181,6 +255,7 @@ public sealed class SensorService : IDisposable
         // does NOT track CPU load (both grow together and cancel), so it's stable.
         // ReadGpu overwrites this for a discrete GPU, never for an AMD iGPU.
         b.GpuW = MathF.Max(0, package - coreSum);
+        return reported;
     }
 
     private static void ReadGpu(IHardware hw, Builder b)
@@ -340,7 +415,9 @@ public sealed class SensorService : IDisposable
     /// <summary>Print every hardware node and sensor for diagnostics (`--dump`).</summary>
     public string Dump()
     {
-        _computer.Accept(_visitor);
+        // Everything, including the nodes the sampling path leaves to other readers:
+        // a dump is for seeing what LHM itself makes of this machine.
+        _computer.Accept(new UpdateVisitor());
         var sb = new System.Text.StringBuilder();
         foreach (var hw in _computer.Hardware)
         {
@@ -359,6 +436,8 @@ public sealed class SensorService : IDisposable
 
     public void Dispose()
     {
+        _nvidia?.Dispose();
+        _nvidia = null;
         _computer.Close();
         _cpuFreq.Dispose();
         _diskLoad.Dispose();
@@ -382,11 +461,12 @@ public sealed class SensorService : IDisposable
     /// <c>ISensor.Value</c> is a separate field from the series, so clearing it
     /// costs nothing this class reads.
     /// </summary>
-    private sealed class UpdateVisitor : IVisitor
+    private sealed class UpdateVisitor(Func<IHardware, bool>? skip = null) : IVisitor
     {
         public void VisitComputer(IComputer c) => c.Traverse(this);
         public void VisitHardware(IHardware h)
         {
+            if (skip?.Invoke(h) == true) return;
             h.Update();
             foreach (var sen in h.Sensors)
             {

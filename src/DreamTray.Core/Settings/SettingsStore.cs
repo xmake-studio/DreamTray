@@ -23,8 +23,15 @@ public sealed class SettingsStore : IDisposable
 
     public AppSettings Current { get; private set; } = new();
 
-    public static string Folder => Path.Combine(
-        Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DreamTray");
+    /// <summary>
+    /// <c>%APPDATA%\DreamTray</c>, unless <c>DREAMTRAY_HOME</c> names another folder —
+    /// which is how a second, <c>--isolated</c> copy runs beside the user's own
+    /// without reading or writing their settings and log.
+    /// </summary>
+    public static string Folder { get; } =
+        Environment.GetEnvironmentVariable("DREAMTRAY_HOME") is { Length: > 0 } home
+            ? home
+            : Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.ApplicationData), "DreamTray");
     public static string FilePath => Path.Combine(Folder, "settings.json");
 
     public SettingsStore(Action<string> log)

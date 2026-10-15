@@ -42,6 +42,8 @@ public sealed class CyberLcdPlugin : DreamPluginBase
     private float? _outdoorCelsius;
     private WeatherLocation? _weatherLocation;
     private long _weatherRevision;
+    /// <summary>Released when the location changes, so the weather loop can sleep until then.</summary>
+    private readonly SemaphoreSlim _weatherChanged = new(0, 1);
 
     private string _status = "stopped";
 
@@ -470,6 +472,12 @@ public sealed class CyberLcdPlugin : DreamPluginBase
         WeatherLongitude = location.Longitude;
         lock (_gate) { _weatherLocation = location; _outdoorCelsius = null; _weatherRevision++; }
         _wake.Set();
+        // A count of one is enough: the loop re-reads the location when it wakes, so
+        // two changes before it gets there are one change to it.
+        if (_weatherChanged.CurrentCount == 0)
+        {
+            try { _weatherChanged.Release(); } catch (SemaphoreFullException) { }
+        }
     }
 
     private static bool ValidLocation(double latitude, double longitude) =>
@@ -496,9 +504,14 @@ public sealed class CyberLcdPlugin : DreamPluginBase
                     nextFetch = DateTime.UtcNow.Add(value.HasValue ? TimeSpan.FromMinutes(10) : TimeSpan.FromMinutes(5));
                     _wake.Set();
                 }
-                else nextFetch = DateTime.UtcNow.AddMinutes(1);
             }
-            try { await Task.Delay(1000, token); }
+            // Asleep until the next fetch is due or the location changes. This used to
+            // wake every second to compare the clock against a ten-minute deadline,
+            // which is a timer and a thread-pool hop per second for nothing; with no
+            // location at all there is nothing to wait for but a change.
+            TimeSpan wait = location is null ? Timeout.InfiniteTimeSpan : nextFetch - DateTime.UtcNow;
+            if (wait != Timeout.InfiniteTimeSpan && wait < TimeSpan.Zero) wait = TimeSpan.Zero;
+            try { await _weatherChanged.WaitAsync(wait, token); }
             catch (OperationCanceledException) { break; }
         }
     }

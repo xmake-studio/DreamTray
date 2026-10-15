@@ -148,6 +148,17 @@ pass/fail. Worth running after any UI change — a tray app's UI otherwise only 
 exercised when a human clicks the icon. Add `--screenshot <dir>` to also write
 `panel.png` and `settings.png` for a look at the layout without opening anything.
 
+```bash
+set DREAMTRAY_HOME=%TEMP%\dreamtray-test
+DreamTray.exe --isolated
+```
+
+Runs a second, complete tray instance beside the one already running — no
+single-instance lock and no plugins, since those hold serial ports the live
+instance owns. `DREAMTRAY_HOME` moves the settings file and the log out of
+`%APPDATA%\DreamTray`, so the two never share either. This is how panel-open
+latency is measured against the real thing.
+
 ---
 
 ## Why it costs nothing when idle
@@ -162,6 +173,20 @@ Task Manager.
   driver is released, not merely left idle.
 - **Closed panel = no subscribers.** Widgets subscribe on show and unsubscribe on
   hide. A closed panel polls nothing at all.
+- **A sensor tick costs about a millisecond.** With a display plugin streaming,
+  the sampler runs once a second all day, so its tick *is* the background cost.
+  LibreHardwareMonitor's NVIDIA node refreshes everything it knows each time —
+  power topology, voltage rails, fans, D3D engine statistics, two PCIe-throughput
+  calls that block 30 ms each — about 80 ms and 80 M cycles on an RTX 3060, for
+  five numbers. `NvidiaReader` reads those through NVML (plus the hot-spot sensor
+  through one NVAPI call) for ~1% of that, with identical values. A CPU node that
+  reports no temperature or power (no PawnIO driver) stops being polled after three
+  empty reads instead of migrating the sampler across every core each second.
+- **No timers that fire to find nothing.** The serial links use plain Win32 comm
+  handles rather than `SerialPort`, whose per-port event thread turned every byte
+  a device echoed into a thread-pool work item; the log flush is armed by a write
+  rather than ticking every 2 s; the weather fetch sleeps until it is due; the
+  brightness writer waits on its queue without a timeout.
 - **Background rules are the explicit exception.** A widget with a rule that must
   run while closed (auto-TDP on charger change, auto-light-theme on battery)
   declares `WantsBackgroundWork`, and the manager keeps exactly one shared 5-second
@@ -173,6 +198,31 @@ Task Manager.
 - **Workstation, non-concurrent GC**, no background JIT churn.
 - **DWM does the visuals.** Acrylic/Mica backdrops and rounded corners are window
   attributes, not app-side blur — no continuous GPU work.
+
+## Why the panel opens instantly
+
+Every `panel open` line in the log carries the time from the click. The open is
+a few milliseconds of work, and the panel is on screen at the compositor's next
+frame:
+
+- **The panel is never hidden.** It is built, shown and rendered once at idle
+  after startup, then cloaked (`DWMWA_CLOAK`) — invisible, not hit-tested, but
+  live, with its last frame held by DWM. Opening uncloaks it and activates it;
+  closing cloaks it again. A WPF window that is hidden gives up its render target,
+  and showing it means a window-manager round trip, a layout pass, a render and a
+  wait for two frames before anything appears — slowest of all after a long idle,
+  which is exactly when a tray panel gets opened.
+- **Widgets wake after the panel is up.** The panel shows what it showed when it
+  was closed; sensor subscriptions and re-reads run at background priority behind
+  the first frame.
+- **Nothing is paged out.** A hard minimum working set (`ProcessTuning.KeepResident`,
+  current working set + 64 MB, capped at 512 MB) keeps the hours the panel spends
+  closed from turning into hard page faults on the next click. It costs RAM the
+  process already uses — no CPU, no wakeups.
+- **Background throttling is left alone.** Windows runs a window-less process at
+  low QoS (efficiency cores, low clocks). The open is short enough to be a few
+  milliseconds even under forced EcoQoS, so DreamTray does not opt out — that would
+  only move the sensor polling and plugin traffic onto performance cores.
 
 ---
 

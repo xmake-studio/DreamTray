@@ -6,13 +6,17 @@ namespace DreamTray.Logging;
 /// Dead-simple append log. Diagnosing hardware access on someone else's laptop is
 /// impossible without one, but it must never cost anything at runtime: writes are
 /// buffered on a background flush and the file is truncated once it passes a cap.
+///
+/// The flush is armed by the first write after the last one went out, not run on a
+/// fixed period: a timer that fires every two seconds to find nothing to write is a
+/// wakeup every two seconds for the life of a process whose whole point is to sleep.
 /// </summary>
 public static class Log
 {
     private static readonly object Gate = new();
     private static readonly StringBuilder Pending = new();
-    private static readonly Timer Flusher =
-        new(_ => Flush(), null, TimeSpan.FromSeconds(2), TimeSpan.FromSeconds(2));
+    private static readonly Timer Flusher = new(_ => Flush(), null, Timeout.Infinite, Timeout.Infinite);
+    private const int FlushDelayMs = 2000;
 
     private const long MaxBytes = 512 * 1024;
 
@@ -26,8 +30,10 @@ public static class Log
             // flyout took to appear, which phase of an open ate the time — all happen
             // well inside one second, and a second-resolution stamp collapses them
             // into a single indistinguishable line.
+            bool armed = Pending.Length > 0;
             Pending.Append(DateTime.Now.ToString("HH:mm:ss.fff")).Append("  ").AppendLine(message);
             if (Pending.Length > 8192) FlushLocked();
+            else if (!armed) Flusher.Change(FlushDelayMs, Timeout.Infinite);
         }
     }
 
