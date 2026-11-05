@@ -61,8 +61,17 @@ internal static class Ui
         return grid;
     }
 
-    public static Grid LabelRow(string label, UIElement right, double topMargin = 0) =>
-        Row(Body(label), right, topMargin);
+    /// <summary>
+    /// A label beside a control. The label wraps rather than running on: a settings
+    /// flyout is only 280 wide, and an unwrapped label longer than the space left of
+    /// the control is cut off mid-word at the column edge.
+    /// </summary>
+    public static Grid LabelRow(string label, UIElement right, double topMargin = 0)
+    {
+        var text = Body(label);
+        text.TextWrapping = TextWrapping.Wrap;
+        return Row(text, right, topMargin);
+    }
 
     public static StackPanel Stack(params UIElement[] children)
     {
